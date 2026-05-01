@@ -32,7 +32,7 @@
 ## 3. Полная архитектура
 
 ```mermaid
-graph TB
+graph TD
     subgraph Client["Клиент"]
         mobile_app["mobile_app"]
     end
