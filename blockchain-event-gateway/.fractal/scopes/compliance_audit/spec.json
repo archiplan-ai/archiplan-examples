@@ -1,0 +1,439 @@
+{
+  "node_types": [
+    {
+      "name": "Subsystem",
+      "definition": "An internal subsystem of the compliance_audit Store: a named, separately-reasoned-about responsibility (admission, chain-write, indexing, assembly, schema, retention) with its own contract surface to siblings and to parent-scope writers.",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "SubStore",
+      "definition": "An internal sub-store of compliance_audit holding state distinct from the hash-chained log itself (e.g. per-(writer,tenant) drain-ack-HLC index, schema-version registry). Sub-stores live inside compliance_audit's trust boundary and are not exposed across the parent-scope substrate boundary.",
+      "layer": "epistatic",
+      "aspects": []
+    }
+  ],
+  "edge_types": [
+    {
+      "name": "calls",
+      "layer": "epistatic",
+      "from_types": [
+        "Subsystem"
+      ],
+      "to_types": [
+        "Subsystem"
+      ]
+    },
+    {
+      "name": "writes_to",
+      "layer": "epistatic",
+      "from_types": [
+        "Subsystem"
+      ],
+      "to_types": [
+        "SubStore"
+      ]
+    },
+    {
+      "name": "reads_from",
+      "layer": "epistatic",
+      "from_types": [
+        "Subsystem"
+      ],
+      "to_types": [
+        "SubStore"
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "admission_gate",
+      "node_type": "Subsystem",
+      "definition": "Inbound RPC entry point for parent-scope writers (region_coordinator, chain_router, gateway, fanout, address_index, usage_meter, tenant_store). Authenticates the caller and validates the typed-entry shape against schema_registry under TWO-PHASE schema activation: PROPOSE entries from compliance_audit_owner pre-load (V, V+1) into schema_registry; admission_gate strictly admits per entry-type under V before activation HLC H_act and under V+1 at-or-after H_act, picking deterministically from the writer-encrypted-at-HLC; replicas more than (H_act - readiness_window) behind the PROPOSE entry deny-by-default for affected entry types until they catch up. CAUSAL LATE-WRITE CHECK: every per-tenant audit write carries (writer-encrypted-at-HLC H_w, writer-emitted monotonic per-(writer, tenant) sequence S_w); admission_gate looks up (writer, tenant) in drain_ack_index to obtain (sealing-HLC H_a, sealing-sequence S_a) plus the tenant-state flag ∈ {UNFENCED, FENCED}. Admission rules: (a) UNFENCED ⇒ admit (tenant has not yet entered any drain-fence regime — drain-ack-HLC = +infinity); (b) FENCED with no sealing drain-ack for the pair ⇒ reject (drain-ack-HLC = -infinity); (c) FENCED with sealing (H_a, S_a) ⇒ reject iff S_w > S_a (writer-side causal violation regardless of arrival order). The tenant-state flag flips UNFENCED → FENCED on the first admitted drain-fence-broadcast entry for the tenant and never flips back. RETROACTIVE VIOLATION DETECTION: when a fresh drain-ack lands, admission_gate scans the bounded retroactive-window for already-admitted writes with S > S_a and writes typed retroactive-protocol-violation entries into chain_log so that arrival-order races still surface. RESIDENCY PINNING: admission_gate computes a residency-decision-tuple (residency_version V_e, partition R_e) from the residency policy active at H_w and embeds it in the entry record passed to tier_splitter and chain_writer; H_w ahead of admission_gate-observed residency policy_version triggers sticky-deny-by-default consistent with the parent-scope residency-2PC contract. Drain-ack-receipt entries from lifecycle_gate cause admission_gate to update drain_ack_index for the (writer, tenant) pair AFTER the entry has been chain-attested via chain_writer (so admission can never observe a drain-ack that is not also chain-attested). VIOLATION COALESCING: admission_gate maintains a per-(writer, tenant) violation-counter and sliding-window state in drain_ack_index; the FIRST violation in window W emits a typed protocol-violation entry carrying full rejection metadata; subsequent violations in W increment the counter without emitting; on window close / counter saturation / distinct-cause arrival the counter is flushed as a single typed violation-summary entry (count, first-seen-HLC, last-seen-HLC, min-S_w, max-S_w). DRAIN-ACK-INDEX SNAPSHOTS: admission_gate periodically appends typed drain-ack-index-snapshot entries into chain_log (small, bounded by N_tenants × M_writers); on restart it rebuilds drain_ack_index from the most recent snapshot plus forward Tier-2 replay (writer_id and tenant_id are present in cleartext on Tier-2 of relevant entry types — see chain_log), so admission_gate can never resume in UNFENCED-by-default for a previously FENCED tenant. APPEND-CLASS STAMPING: admission_gate stamps each forwarded entry with its append-class label (cert_assembler / drain-ack-receipt / protocol-violation / normal-per-tenant / retention-shred / schema-activation / operator-override / drain-ack-index-snapshot) so chain_writer can route into the correct fair-queue lane.",
+      "aspects": []
+    },
+    {
+      "id": "tier_splitter",
+      "node_type": "Subsystem",
+      "definition": "Composes the paired Tier-1 + Tier-2 representation for each admitted entry. For per-tenant entries it requests Tier-1 encryption from tenant_store with the writer-encrypted-at-HLC H_w and writer-sequence S_w as part of the request; tenant_store rejects encrypt-RPCs whose H_w is at-or-after the audit-key destruction-fence-HLC H_destroy with a typed key-destroyed-at-fence response carrying H_destroy. On that response, tier_splitter NEVER drops silently: it writes a typed key-destroyed-encrypt-failure entry into chain_log via chain_writer carrying ONLY the Tier-2 structural witness (event type, H_w, originating component, key-destroyed reason) with NO Tier-1 ciphertext; cert_assembler downstream interprets these as erasure-incomplete or partial-with-witnesses signal (writer believed it had a legitimate write to make AFTER the destroy fence — its upstream drain-ack contract was violated). For successful encryption the per-tenant audit-key handle lookup is HLC-anchored on H_w (so a key rotated between admission and tier_splitter does not encrypt under the wrong key). The Tier-2 structural witness is signed under the FORWARD-SECURE Tier-2 signing key for the current epoch (see chain_log epoch model) — event type, event HLC, originating component, hash commitment to the Tier-1 payload, and for routing-identifier entry types (drain-ack-receipt, drain-fence-broadcast, drain-ack-index-snapshot, key-destroyed-encrypt-failure, retroactive-protocol-violation, violation-summary, cert-input-pin) ALSO (writer_id, tenant_id, H_a, S_a / sealing-tuple as applicable) in cleartext (these are routing identifiers that exist in numerous non-shreddable parent-scope locations; their presence in Tier-2 does not violate crypto-shred semantics, which destroys content not existence-of-tenant). For non-tenant-keyed entries (operator-overrides, OOB-anchor use, anchor rotation, residency-policy events, roster mutations, schema-activation, retention-shred records) Tier-1 is empty/identity and Tier-2 carries the full structural payload directly. Both Tier-1 ciphertext and Tier-2 witness are wrapped into a single chain-entry record passed to chain_writer with the residency-decision-tuple (V_e, R_e) and append-class label propagated from admission_gate.",
+      "aspects": []
+    },
+    {
+      "id": "chain_writer",
+      "node_type": "Subsystem",
+      "definition": "Single point of append into the residency-tagged hash-chained log under a BOUNDED-CONCURRENCY MICRO-BATCH model with PER-CLASS FAIR-QUEUEING. Receives prepared chain-entry records carrying a residency-decision-tuple (V_e, R_e) computed at admission_gate from the writer-encrypted-at-HLC and an append-class label. Commits each entry into partition R_e regardless of the residency policy_version active at commit time (the policy is HLC-anchored at admission). Per-residency append model: chain_writer assembles micro-batches of up to N entries; each micro-batch is a single CAS-on-tip-hash committing the batch with an internal Merkle-tree-of-entries root so per-entry verification stays constant-time; the chain prev-hash links micro-batch to micro-batch. PER-CLASS FAIR LANES (cert_assembler / drain-ack-receipt / protocol-violation / normal-per-tenant-write / retention-shred / schema-activation / operator-override / drain-ack-index-snapshot) each hold a guaranteed minimum micro-batch-slot share so latency-sensitive classes (cert_assembler closing certs against regulatory windows, drain-ack-receipt feeding the late-write check, schema-activation feeding deny-by-default cutover) cannot starve behind bulk per-tenant or retention-shred traffic. Per-class fair-queueing parameters are themselves typed entries owned by region_coordinator and audit-logged through the same chain. Refuses any append whose H_w, residency-decision-tuple, schema_version, or append-class is not internally consistent with the routing rule.",
+      "aspects": []
+    },
+    {
+      "id": "chain_log",
+      "node_type": "SubStore",
+      "definition": "Residency-partitioned, append-only, micro-batched, hash-chained log. Each micro-batch record holds (sequence, prev-hash, batch-hash, schema_version, residency_version, append-class-mix, internal Merkle-tree-of-entries root) and the contained entries hold (entry-hash within batch-Merkle, residency-decision-tuple V_e+R_e, Tier-1 ciphertext blob, Tier-2 structural-witness signed under the FORWARD-SECURE Tier-2 signing key for the active epoch). Tier-2 contains no tenant-attributable content but DOES carry routing identifiers in cleartext on entries where rebuilds depend on them (drain-ack-receipt, drain-fence-broadcast, drain-ack-index-snapshot, key-destroyed-encrypt-failure, retroactive-protocol-violation, violation-summary, cert-input-pin) — see tier_splitter. Tier-1 is opaque ciphertext. The substrate exposes append-and-CAS-on-tip-hash (one CAS per micro-batch), read-by-sequence-or-by-batch-hash-or-by-entry-hash, and per-residency tip-hash inspection. FORWARD-SECURE TIER-2 EPOCHS: the active Tier-2 signing key advances one epoch per micro-batch (or per fixed bounded chain-prefix); each epoch transition appends a typed tier2-epoch-witness entry committing the new epoch verification material under OOB-anchor signature. Forward security: a compromised epoch-K key cannot mint signatures attributable to epoch K-1 or earlier. Compromise of the active epoch is recorded as a typed tier2-key-compromise entry naming compromised epoch and the new active epoch; downstream verification of any Tier-2 witness from a compromised epoch yields suspect-witness mode without invalidating prior epochs. The epoch-witness chain is verified against OOB-anchor signatures rooted in region_coordinator parent-scope OOB-anchor M-of-N quorum. RETENTION INTERLOCK: cert-input-pin entries (typed entries written by tenant_store via admission_gate when an assembly trigger opens) name entry-hashes that retention_enforcer must treat as retention-extended until the certificate-of-deletion entry referencing them is appended or the pin is explicitly released. drain-ack-index-snapshot entries are non-shreddable until superseded by a fresher snapshot. SHRED PRESERVES STRUCTURE: shred destroys readability of Tier-1 ciphertext blob only — entry-hash, prev-hash, batch-hash, internal Merkle proofs, and Tier-2 witness all remain so external chain integrity verification and structural-presence verification survive both tenant-driven crypto-shred and retention-driven shred.",
+      "aspects": []
+    },
+    {
+      "id": "drain_ack_index",
+      "node_type": "SubStore",
+      "definition": "In-memory authoritative index of per-(writer, tenant) drain-ack state plus per-tenant fence state plus per-(writer, tenant) violation-coalescing state. For each (writer_id, tenant_id) pair: (sealing-HLC H_a, sealing-sequence S_a, originating drain-fence-broadcast id, chain-entry sequence at which the ack was attested in chain_log) plus violation-counter and sliding-window state for late-write coalescing. For each tenant_id: tenant-state flag ∈ {UNFENCED, FENCED} (flips UNFENCED → FENCED on the first admitted drain-fence-broadcast entry; never flips back) so admission_gate cold-miss semantics are deterministic. Updated only by admission_gate as a strictly-after-chain-append side effect of admitting drain-ack-receipt, drain-fence-broadcast, protocol-violation, violation-summary, or drain-ack-index-snapshot entries. Rebuildable on restart from the most recent drain-ack-index-snapshot entry in chain_log plus forward Tier-2 replay (writer_id and tenant_id are present in cleartext on Tier-2 of the relevant entry types — see chain_log) so admission_gate cannot resume in UNFENCED-by-default for a previously FENCED tenant.",
+      "aspects": []
+    },
+    {
+      "id": "cert_assembler",
+      "node_type": "Subsystem",
+      "definition": "Assembles typed certificate-of-deletion entries on behalf of tenant_store. tenant_store opens an assembly trigger by appending a typed cert-input-pin entry into chain_log (via admission_gate / chain_writer) naming the entry-hashes the cert will reference; retention_enforcer treats those pinned entry-hashes as retention-extended until the certificate-of-deletion entry referencing them is appended or the pin is released. cert_assembler then receives the assembly inputs (per-store erasure attestations + drain-ack receipts from the parent-scope writers + audit-key DESTROYED entry from lifecycle_gate + any key-destroyed-encrypt-failure entries for the tenant), looks each input up in chain_log by entry-hash, and verifies chain presence and provenance (writer, lease/policy_version, broadcast HLC). PER-INPUT VERIFICATION-MODE: each verified input is classified as Tier-1-and-Tier-2-verified (Tier-1 still readable at assembly time) vs Tier-2-only-verified (Tier-1 retention-shredded but Tier-2 structural witness present) vs suspect-witness (Tier-2 signed under a compromised epoch per the tier2-key-compromise entry); the certificate-of-deletion record carries the per-input verification-mode. CERT TYPING: full-ack iff all expected inputs are STRUCTURALLY PRESENT in chain_log (Tier-2 verified is sufficient; Tier-1 readability is not required because structural-presence is what regulators need post-shred); partial-with-witnesses iff one or more expected inputs are structurally absent OR one or more key-destroyed-encrypt-failure entries exist for the tenant; erasure-incomplete iff the audit-key DESTROYED entry is missing OR a preservation-blocked condition is recorded. The typed certificate is machine-distinguishable from full-ack and is itself appended via chain_writer in the cert_assembler fair-queue lane. cert_assembler does not finalize tenant_store erasure — it only writes the certificate; tenant_store reads the type to decide downstream actions.",
+      "aspects": []
+    },
+    {
+      "id": "schema_registry",
+      "node_type": "SubStore",
+      "definition": "In-process registry of currently-active entry-type schemas under a TWO-PHASE PROPOSE/ACTIVATE protocol. region_coordinator compliance_audit_owner publishes a new schema version V+1 by appending a typed schema-version-PROPOSE entry into chain_log carrying the proposed activation HLC H_act in the future. admission_gate observes the PROPOSE entry, pre-loads (V, V+1) into schema_registry, and exposes the (V, V+1, H_act) triple. Strict cutover: admission_gate admits each entry under V before H_act and under V+1 at-or-after H_act based on the writer-encrypted-at-HLC; never both for the same logical event. A subsequent typed schema-version-ACTIVATE entry post-H_act seals the transition and removes V from schema_registry once no in-flight admissions reference it. Replicas more than (H_act - readiness_window) behind the PROPOSE entry deny-by-default for affected entry types until they catch up. Sourced schema records are themselves typed entries in chain_log; schema_registry is reconstructable by replay over those entries.",
+      "aspects": []
+    },
+    {
+      "id": "retention_enforcer",
+      "node_type": "Subsystem",
+      "definition": "Applies the jurisdiction-bound retention policy propagated through region_coordinator residency_publisher to chain_log entries. For each (residency, entry-type) pair holds the active retention window and on retention expiry crypto-shreds (deletes Tier-1 ciphertext only) entries past the bound, leaving Tier-2 witness, entry-hash, prev-hash, batch-hash, and Merkle proofs in place so chain integrity and structural-presence verification survive. RETENTION INTERLOCK: retention_enforcer never shreds chain_log entry-hashes named by an open or pending cert-input-pin entry — pinned hashes are treated as retention-extended until the referencing certificate-of-deletion entry is appended or the pin is explicitly released by tenant_store. drain-ack-index-snapshot entries are likewise non-shreddable while they remain the most-recent-snapshot for any (writer-set, tenant-set) projection currently used by admission_gate rebuild; supersession by a fresher snapshot releases the prior snapshot for normal retention. Retention-driven shred is itself logged as a typed retention-shred entry into chain_log via chain_writer (in the retention-shred fair-queue lane) so post-shred a regulator can verify which entries were retention-shredded vs tenant-shredded vs surviving.",
+      "aspects": []
+    }
+  ],
+  "edges": [
+    [
+      "admission_gate",
+      "drain_ack_index",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "admission_gate",
+      "drain_ack_index",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "admission_gate",
+      "schema_registry",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "admission_gate",
+      "tier_splitter",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "admission_gate",
+      "chain_writer",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "tier_splitter",
+      "chain_writer",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "chain_writer",
+      "chain_log",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "chain_writer",
+      "chain_log",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "cert_assembler",
+      "chain_log",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "cert_assembler",
+      "chain_writer",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "retention_enforcer",
+      "chain_log",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "retention_enforcer",
+      "chain_writer",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "admission_gate",
+      "schema_registry",
+      {
+        "edge_type": "writes_to"
+      }
+    ]
+  ],
+  "requirements": [
+    {
+      "id": "r-init-late-write-rejection",
+      "targets": [
+        {
+          "Node": "admission_gate"
+        }
+      ],
+      "description": "compliance_audit must reject writes whose writer-encrypted-at-HLC exceeds the writer drain-ack-HLC for the same tenant as protocol violations at admission, and log the rejection itself; the shred mechanism applies only to entries that landed BEFORE the writer drain-ack-HLC.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "r-init-tier-witness",
+      "targets": [
+        {
+          "Node": "tier_splitter"
+        }
+      ],
+      "description": "Audit material is two-tier: TIER 1 (per-tenant audit-encryption key, shredded on tenant erasure) holds the tenant-attributable payload, TIER 2 (organizational long-lived OOB-anchor-rooted key, NOT shredded) holds a structural witness (event type, HLC, originating component, hash commitment to Tier-1 payload) with no tenant-identifying material; certificate-of-deletion vouches for Tier-2 witnesses post-shred.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "r-init-chain-shred-integrity",
+      "targets": [
+        {
+          "Node": "chain_log"
+        }
+      ],
+      "description": "Tenant audit-key destruction (crypto-shred) renders Tier-1 ciphertext unreadable but leaves the hash chain intact: prev-hash links, entry-hash, and Tier-2 witness all survive; an external verifier can still confirm chain integrity and structural-presence of every attested event for the tenant after shred.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "r-init-cert-of-deletion-typing",
+      "targets": [
+        {
+          "Node": "cert_assembler"
+        }
+      ],
+      "description": "cert_assembler emits typed certificate-of-deletion entries (full-ack / partial-with-witnesses / erasure-incomplete) over assembly inputs (per-store erasure attestations + drain-ack receipts + audit-key DESTROYED log entry), each input verified present in chain_log and provenance-tagged (writer, lease/policy_version, broadcast HLC); the certificate type is machine-distinguishable from full-ack.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "r-cold-miss-tenant-state-flag",
+      "targets": [
+        {
+          "Node": "admission_gate"
+        }
+      ],
+      "description": "admission_gate explicit cold-miss semantics: drain_ack_index entries carry a tenant-state flag ∈ {UNFENCED, FENCED}. UNFENCED means no drain-fence has been issued for the tenant — all admissions are allowed (writer is in tenant bootstrap, not yet under any fence contract). FENCED means at least one drain-fence-broadcast for the tenant has been observed by admission_gate — absence of a drain-ack-receipt for a (writer, tenant) pair under FENCED means drain-ack-HLC = -infinity (REJECT every per-tenant write). The flag flips UNFENCED → FENCED on the first admitted drain-fence-broadcast entry for the tenant; never flips back. admission_gate maintains the flag at tenant scope (not per-pair) so it is consistent across writers.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-drain-ack-cold-miss"
+      }
+    },
+    {
+      "id": "r-causal-sequence-late-write",
+      "targets": [
+        {
+          "Node": "admission_gate"
+        }
+      ],
+      "description": "admission_gate late-write check is bound to writer-side causal ordering: every per-tenant audit write carries a writer-emitted monotonic per-(writer, tenant) sequence number S_w plus its writer-encrypted-at-HLC H_w. Each drain-ack-receipt entry from lifecycle_gate attests (drain-ack-HLC=H_a, sealing-sequence=S_a) — i.e. covers all writer sequences ≤ S_a. admission_gate stores (H_a, S_a) per (writer, tenant) in drain_ack_index. A write with sequence S_w arriving at admission_gate is rejected as a protocol-violation iff (S_w > S_a) under the active fence (the writer emitted it after its own ack, regardless of arrival order). Drain-acks that arrive BEFORE a late write also seal correctly. Symmetrically, on a fresh drain-ack landing, admission_gate scans for already-admitted writes with S > S_a within a bounded retroactive window and writes retroactive-protocol-violation entries into chain_log so the violation is auditable even if the late write arrived first.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-drain-ack-arrival-race"
+      }
+    },
+    {
+      "id": "r-schema-two-phase-activation",
+      "targets": [
+        {
+          "Node": "schema_registry"
+        }
+      ],
+      "description": "Schema-version activation across admission_gate replicas is two-phase with a quorum-witnessed activation HLC H_act. PROPOSE entry from compliance_audit_owner pre-loads V+1 alongside V in schema_registry; ACTIVATE is the temporal cutover at H_act. admission_gate strictly admits entry types under V before H_act and under V+1 at-or-after H_act using the writer-encrypted-at-HLC; never both. Replicas that have not observed the PROPOSE entry by (H_act - readiness_window) deny-by-default for the affected entry types until they catch up. schema_registry exposes the (V, V+1, H_act) triple during the propose-to-activate window. Eliminates same-event cross-schema double-writes.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-schema-replica-skew"
+      }
+    },
+    {
+      "id": "r-key-destroyed-encrypt-failure-witness",
+      "targets": [
+        {
+          "Node": "tier_splitter"
+        }
+      ],
+      "description": "tier_splitter encrypt-RPC failure on a destroyed audit-encryption key never silently drops: tenant_store returns a typed key-destroyed-at-fence response carrying H_destroy; tier_splitter writes a key-destroyed-encrypt-failure typed entry into chain_log via chain_writer carrying only the Tier-2 structural witness plus the destroy-fence reason; no Tier-1 ciphertext. cert_assembler interprets any such entry for a tenant as erasure-incomplete or partial-with-witnesses signal: the writer believed it had a legitimate write to make AFTER the destroy fence so its upstream drain-ack contract was violated and the cert type must reflect this.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-key-destroy-encrypt-race"
+      }
+    },
+    {
+      "id": "r-chain-writer-class-fair-queue",
+      "targets": [
+        {
+          "Node": "chain_writer"
+        }
+      ],
+      "description": "chain_writer admits entries via per-residency bounded-concurrency micro-batches with per-class fair-queueing. Each micro-batch is a single CAS-on-tip-hash that commits N entries; the chain prev-hash links micro-batch to micro-batch; an internal Merkle-tree-of-entries root in each micro-batch lets per-entry entry-hash verification stay constant-time. Append classes (cert_assembler, drain-ack-receipt, protocol-violation, normal per-tenant write, retention-shred, schema-activation, operator-override) each hold a guaranteed minimum micro-batch-slot share so cert_assembler and protocol-violation entries cannot starve behind bulk per-tenant traffic or retention-shred waves. Per-class fair-queueing parameters are themselves typed entries owned by region_coordinator and audit-logged through the same substrate.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-chain-writer-bulk-contention"
+      }
+    },
+    {
+      "id": "r-cert-input-pin-and-verification-mode",
+      "targets": [
+        {
+          "Node": "cert_assembler"
+        }
+      ],
+      "description": "Two-part contract for cert_assembler reading retention-shredded inputs. (a) tenant_store opens an assembly trigger by appending a cert-input-pin typed entry naming the entry-hashes the cert will reference; retention_enforcer reads chain_log and treats pinned entry-hashes as retention-extended until the certificate-of-deletion entry referencing them is appended or the pin is explicitly released. (b) cert_assembler classifies each verified input as Tier-2-only-verified vs Tier-1-and-Tier-2-verified based on Tier-1 readability at assembly time; the certificate-of-deletion record carries a per-input verification-mode field. Structural-presence (Tier-2 verified) is sufficient to retain full-ack typing; partial-with-witnesses applies only when an expected input is structurally absent from chain_log.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-cert-input-retention-shredded"
+      }
+    },
+    {
+      "id": "r-tier2-forward-secure-epochs",
+      "targets": [
+        {
+          "Node": "tier_splitter"
+        }
+      ],
+      "description": "Tier-2 signing uses a forward-secure key-evolution scheme rooted in the OOB-anchor key hierarchy. The active Tier-2 signing key advances one epoch per chain_log micro-batch (or per fixed bounded chain-prefix); each epoch transition appends a typed tier2-epoch-witness entry committing the new epoch verification material under OOB-anchor signature. Forward security: a compromised epoch-K key cannot mint signatures attributable to epoch K-1 or earlier. A verifier validates a Tier-2 witness against the epoch verification material committed in the epoch-witness entry, anchored through the chain to OOB-anchor signature. Compromise is handled by appending a typed tier2-key-compromise entry naming the compromised epoch and the new active epoch; cert_assembler treats Tier-2 witnesses from a compromised epoch as suspect-witness verification-mode without invalidating prior epochs.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-tier2-key-compromise"
+      }
+    },
+    {
+      "id": "r-residency-pinned-to-write-hlc",
+      "targets": [
+        {
+          "Node": "admission_gate"
+        }
+      ],
+      "description": "Residency partitioning of an audit entry is HLC-anchored to the writer-encrypted-at-HLC, not to chain-writer commit time. admission_gate computes the residency-decision-tuple (residency_version V_e, partition R_e) from the residency policy active at the writer-encrypted-at-HLC and embeds the tuple in the entry record. chain_writer commits into partition R_e regardless of the residency policy_version active at commit time. tier_splitter likewise looks up the per-tenant audit-key handle by HLC, ensuring Tier-1 ciphertext is encrypted under the key that was active when the writer emitted the entry. admission_gate denies-by-default any entry whose H_w is ahead of the admission_gate-observed residency policy_version (sticky-deny consistent with parent-scope contract).",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-residency-flip-mid-write"
+      }
+    },
+    {
+      "id": "r-drain-ack-rebuild-completeness",
+      "targets": [
+        {
+          "Node": "admission_gate"
+        }
+      ],
+      "description": "admission_gate drain_ack_index rebuild after restart is complete by construction. (a) Tier-2 structural witness for drain-ack-receipt entries and tenant-fence-state-transition entries carries the (writer_id, tenant_id, drain-ack-HLC, sealing-sequence) tuple in cleartext (these are routing identifiers, not tenant-attributable content — they appear in many non-shreddable parent-scope locations and shred destroys content not existence-of-tenant). (b) admission_gate persists periodic drain_ack_index snapshots as typed snapshot entries into chain_log; retention_enforcer treats the most recent snapshot as non-shreddable (until superseded). On restart admission_gate rebuilds from the most recent snapshot plus forward Tier-2 replay; the rebuilt baseline is provably complete and admission_gate cannot resume in an UNFENCED-by-default state for a tenant that was previously FENCED.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-drain-ack-rebuild-incomplete"
+      }
+    },
+    {
+      "id": "r-violation-summary-coalescing",
+      "targets": [
+        {
+          "Node": "admission_gate"
+        }
+      ],
+      "description": "admission_gate coalesces repeated late-write violations from the same (writer, tenant) pair within a sliding window of width W into a bounded-state violation-summary record. First violation in a window emits a typed protocol-violation entry; subsequent violations within W increment a per-(writer,tenant) counter in drain_ack_index without emitting further entries. On window close / counter saturation / distinct-cause arrival, admission_gate emits a single typed violation-summary entry carrying (count, first-seen-HLC, last-seen-HLC, min-S_w, max-S_w). chain growth becomes O(distinct (writer,tenant) per window) under flood. The summary preserves enough information for upstream credential-revocation triggers without preserving per-violation fidelity.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-violation-flood-self-dos"
+      }
+    }
+  ],
+  "satisfactions": [
+    {
+      "requirement_id": "r-init-late-write-rejection",
+      "explanation": "admission_gate definition specifies the inbound admission check: looks up (writer, tenant) drain-ack-HLC in drain_ack_index and rejects writes with writer-encrypted-at-HLC > drain-ack-HLC as protocol-violations; rejected writes still traverse chain_writer as protocol-violation entries (typed distinct from normal entries) so the rejection itself is auditable; index updates from drain-ack-receipt entries are sequenced strictly after chain-append commits so admission can never observe a drain-ack that is not also chain-attested."
+    },
+    {
+      "requirement_id": "r-init-tier-witness",
+      "explanation": "tier_splitter composes Tier-1 ciphertext (encrypted under tenant_store-owned per-tenant audit-encryption key via the encrypt-RPC; tier_splitter only consumes the active key handle) and Tier-2 structural witness (event type, HLC, originating component, hash commitment to Tier-1 payload) signed under the OOB-anchor-rooted organizational long-lived key. For non-tenant-keyed entries Tier-1 is empty/identity and Tier-2 carries the structural payload directly. Both Tier-1 ciphertext and Tier-2 witness are wrapped into a single chain-entry record passed to chain_writer."
+    },
+    {
+      "requirement_id": "r-init-chain-shred-integrity",
+      "explanation": "chain_log entry tuple is (sequence, prev-hash, entry-hash, schema_version, residency_version, Tier-1 ciphertext blob, Tier-2 structural-witness signed under organizational long-lived key); shred destroys readability of Tier-1 ciphertext blob only — entry-hash, prev-hash, and Tier-2 witness remain. External chain integrity verification reads only entry-hash and prev-hash columns; structural-presence verification reads Tier-2; both survive shred by construction."
+    },
+    {
+      "requirement_id": "r-init-cert-of-deletion-typing",
+      "explanation": "cert_assembler receives assembly trigger and inputs from tenant_store (per-store erasure attestations + drain-ack receipts) plus the audit-key DESTROYED entry from lifecycle_gate, looks each component up in chain_log by entry-hash to verify chain presence and provenance (writer, lease/policy_version, broadcast HLC), classifies the result as full-ack / partial-with-witnesses / erasure-incomplete with machine-distinguishable typing, and submits the typed certificate-of-deletion record to chain_writer for append."
+    },
+    {
+      "requirement_id": "r-cold-miss-tenant-state-flag",
+      "explanation": "admission_gate redefinition specifies the tenant-state flag {UNFENCED, FENCED} held in drain_ack_index per tenant: UNFENCED admits all per-tenant writes (drain-ack-HLC = +infinity, no fence yet); FENCED with no sealing drain-ack rejects (drain-ack-HLC = -infinity); FENCED with sealing (H_a, S_a) applies the causal late-write check. The flag flips UNFENCED → FENCED on the first admitted drain-fence-broadcast entry for the tenant and never flips back. drain_ack_index redefinition mirrors the per-tenant flag and the irreversible flip rule."
+    },
+    {
+      "requirement_id": "r-causal-sequence-late-write",
+      "explanation": "admission_gate redefinition: every per-tenant write carries (H_w, S_w); drain_ack_index stores (H_a, S_a) per (writer, tenant); admission rejects iff S_w > S_a (FENCED) regardless of arrival order. Retroactive detection: when a fresh drain-ack lands, admission_gate scans the bounded retroactive-window for already-admitted writes with S > S_a and emits typed retroactive-protocol-violation entries into chain_log so arrival-order races still surface."
+    },
+    {
+      "requirement_id": "r-schema-two-phase-activation",
+      "explanation": "schema_registry redefinition: two-phase PROPOSE/ACTIVATE protocol with quorum-witnessed activation HLC H_act; admission_gate strictly admits under V before H_act and V+1 at-or-after H_act; deny-by-default for replicas more than (H_act - readiness_window) behind the PROPOSE entry. (V, V+1, H_act) triple exposed in registry; same-event cross-schema double-write eliminated by deterministic cutover on writer-encrypted-at-HLC."
+    },
+    {
+      "requirement_id": "r-key-destroyed-encrypt-failure-witness",
+      "explanation": "tier_splitter redefinition: tenant_store rejects encrypt-RPCs with H_w >= H_destroy via typed key-destroyed-at-fence response; tier_splitter writes a typed key-destroyed-encrypt-failure entry into chain_log via chain_writer carrying only Tier-2 structural witness with the destroy-fence reason; never silent drop. cert_assembler redefinition treats these entries as partial-with-witnesses or erasure-incomplete signal."
+    },
+    {
+      "requirement_id": "r-chain-writer-class-fair-queue",
+      "explanation": "chain_writer redefinition: per-residency bounded-concurrency micro-batch model; each micro-batch is a single CAS-on-tip-hash committing N entries with internal Merkle-tree-of-entries root; chain prev-hash links micro-batch to micro-batch. Per-class fair-queueing across cert_assembler / drain-ack-receipt / protocol-violation / normal-per-tenant-write / retention-shred / schema-activation / operator-override / drain-ack-index-snapshot lanes with guaranteed minimum slot shares. Fair-queueing parameters are themselves typed entries owned by region_coordinator and audit-logged through the chain. chain_log redefinition mirrors the micro-batch record shape."
+    },
+    {
+      "requirement_id": "r-cert-input-pin-and-verification-mode",
+      "explanation": "cert_assembler redefinition: tenant_store opens an assembly trigger by appending a typed cert-input-pin entry naming target entry-hashes; retention_enforcer treats pinned hashes as retention-extended until the cert-of-deletion entry referencing them is appended or the pin is released. Per-input verification-mode (Tier-1-and-Tier-2-verified, Tier-2-only-verified, suspect-witness) recorded in the cert. full-ack typing requires only structural-presence; partial-with-witnesses iff structural absence or any key-destroyed-encrypt-failure for the tenant. retention_enforcer redefinition mirrors the pin interlock; chain_log redefinition mirrors the pin entry shape."
+    },
+    {
+      "requirement_id": "r-tier2-forward-secure-epochs",
+      "explanation": "chain_log redefinition: forward-secure Tier-2 epoch model with per-micro-batch (or fixed bounded chain-prefix) epoch advance; typed tier2-epoch-witness entries commit per-epoch verification material under OOB-anchor signature; typed tier2-key-compromise entries name compromised epochs. tier_splitter signs Tier-2 under the active epoch key; cert_assembler classifies Tier-2 from compromised epochs as suspect-witness verification-mode without invalidating prior epochs. Verifiers anchor through chain prev-hash to OOB-anchor signature backed by region_coordinator parent-scope OOB-anchor M-of-N quorum."
+    },
+    {
+      "requirement_id": "r-residency-pinned-to-write-hlc",
+      "explanation": "admission_gate redefinition computes the residency-decision-tuple (V_e, R_e) from the residency policy active at the writer-encrypted-at-HLC and embeds it in the entry record; chain_writer commits into partition R_e regardless of current residency policy_version; tier_splitter looks up the per-tenant audit-key handle by HLC. admission_gate denies-by-default any entry whose H_w is ahead of admission_gate-observed residency policy_version (sticky-deny consistent with parent-scope residency-2PC contract)."
+    },
+    {
+      "requirement_id": "r-drain-ack-rebuild-completeness",
+      "explanation": "tier_splitter redefinition specifies that for routing-identifier entry types (drain-ack-receipt, drain-fence-broadcast, drain-ack-index-snapshot, key-destroyed-encrypt-failure, retroactive-protocol-violation, violation-summary, cert-input-pin) Tier-2 carries (writer_id, tenant_id, H_a/sealing-tuple) in cleartext; chain_log mirrors. admission_gate redefinition: periodic typed drain-ack-index-snapshot entries appended into chain_log; restart rebuilds from most-recent snapshot plus forward Tier-2 replay. retention_enforcer treats most-recent snapshot as non-shreddable until superseded. admission_gate cannot resume in UNFENCED-by-default for a previously FENCED tenant."
+    },
+    {
+      "requirement_id": "r-violation-summary-coalescing",
+      "explanation": "admission_gate redefinition: per-(writer, tenant) violation-counter and sliding-window state in drain_ack_index; first violation in window W emits a typed protocol-violation entry with full metadata; subsequent violations in W increment counter without emitting; on window close / counter saturation / distinct-cause arrival a single typed violation-summary entry (count, first-seen-HLC, last-seen-HLC, min-S_w, max-S_w) is appended. drain_ack_index redefinition mirrors the coalescing state. chain growth from a flood becomes O(distinct (writer,tenant) per window)."
+    }
+  ]
+}

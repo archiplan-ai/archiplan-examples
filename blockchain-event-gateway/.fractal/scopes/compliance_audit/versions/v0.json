@@ -1,0 +1,259 @@
+{
+  "node_types": [
+    {
+      "name": "Subsystem",
+      "definition": "An internal subsystem of the compliance_audit Store: a named, separately-reasoned-about responsibility (admission, chain-write, indexing, assembly, schema, retention) with its own contract surface to siblings and to parent-scope writers.",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "SubStore",
+      "definition": "An internal sub-store of compliance_audit holding state distinct from the hash-chained log itself (e.g. per-(writer,tenant) drain-ack-HLC index, schema-version registry). Sub-stores live inside compliance_audit's trust boundary and are not exposed across the parent-scope substrate boundary.",
+      "layer": "epistatic",
+      "aspects": []
+    }
+  ],
+  "edge_types": [
+    {
+      "name": "calls",
+      "layer": "epistatic",
+      "from_types": [
+        "Subsystem"
+      ],
+      "to_types": [
+        "Subsystem"
+      ]
+    },
+    {
+      "name": "writes_to",
+      "layer": "epistatic",
+      "from_types": [
+        "Subsystem"
+      ],
+      "to_types": [
+        "SubStore"
+      ]
+    },
+    {
+      "name": "reads_from",
+      "layer": "epistatic",
+      "from_types": [
+        "Subsystem"
+      ],
+      "to_types": [
+        "SubStore"
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "admission_gate",
+      "node_type": "Subsystem",
+      "definition": "Inbound RPC entry point for parent-scope writers (region_coordinator, chain_router, gateway, fanout, address_index, usage_meter, tenant_store). Authenticates the caller, validates the typed-entry shape against the schema_registry currently-active entry-type version, and runs the inbound admission check for per-tenant writes — looks up the (writer, tenant) drain-ack-HLC in drain_ack_index and rejects writes whose writer-encrypted-at-HLC exceeds that bound as a protocol-violation. Valid writes are forwarded to tier_splitter; rejected writes still traverse chain_writer as protocol-violation entries (typed distinct from normal entries) so the violation itself is auditable. Drain-ack-receipt entries from lifecycle_gate cause admission_gate to update drain_ack_index for the (writer, tenant) pair before the entry is appended; index update and chain-append are sequenced so admission cannot observe a drain-ack that is not also chain-attested.",
+      "aspects": []
+    },
+    {
+      "id": "tier_splitter",
+      "node_type": "Subsystem",
+      "definition": "Composes the paired Tier-1 + Tier-2 representation for each admitted entry. For per-tenant entries it requests Tier-1 encryption against the per-tenant audit-encryption key (the key itself is tenant_store-owned per the at-root contract; tier_splitter only consumes the active key handle and the encrypt-RPC) and constructs the Tier-1 ciphertext over the full tenant-attributable payload. It then derives the Tier-2 structural witness — event type, event HLC, originating component, and the hash commitment to the Tier-1 payload — and wraps both into a single chain-entry record presented to chain_writer. For non-tenant-keyed entries (operator-overrides, OOB-anchor use, anchor rotation, residency-policy events, roster mutations, etc.) Tier-1 is an empty/identity payload and Tier-2 carries the full structural witness directly. The Tier-2 organizational long-lived signing key is rooted in the OOB-anchor key hierarchy at parent scope; tier_splitter consumes that key handle and never holds long-lived material itself.",
+      "aspects": []
+    },
+    {
+      "id": "chain_writer",
+      "node_type": "Subsystem",
+      "definition": "Single point of append into the residency-tagged hash-chained log. Receives prepared chain-entry records from tier_splitter (normal entries) or directly from admission_gate (protocol-violation entries) or from cert_assembler (certificate-of-deletion entries). Resolves the residency partition from the entry routing rule (per-tenant entries follow the tenant residency policy_version active at the entry HLC; non-tenant entries follow the originating-component policy), reads the partition tip-hash from chain_log, computes the new entry hash linking to that tip, and performs the append-and-CAS-on-tip-hash; on CAS conflict it retries against the new tip. Refuses any append whose writer-encrypted-at-HLC, residency_version, or schema_version is not internally consistent with the routing rule.",
+      "aspects": []
+    },
+    {
+      "id": "chain_log",
+      "node_type": "SubStore",
+      "definition": "The residency-partitioned, append-only, hash-chained log itself. Each entry is a tuple of (sequence, prev-hash, entry-hash, schema_version, residency_version, Tier-1 ciphertext blob, Tier-2 structural-witness signed under the organizational long-lived key). Tier-2 contains no tenant-identifying material; Tier-1 is opaque ciphertext to chain_log. Per-residency partitions hold per-residency tip-hashes; the substrate exposes append-and-CAS-on-tip-hash and read-by-sequence-or-by-entry-hash. Retention of full entry bodies is bounded by the retention_enforcer; Tier-2 commitments survive Tier-1 crypto-shred (the ciphertext column becomes unreadable but the entry-hash, prev-hash, and Tier-2 witness remain).",
+      "aspects": []
+    },
+    {
+      "id": "drain_ack_index",
+      "node_type": "SubStore",
+      "definition": "Per-(writer, tenant) drain-ack-HLC state. For each (writer_id, tenant_id) pair holds the last drain-ack-HLC observed (the upper bound that admission_gate enforces for that pair) plus the originating drain-fence broadcast id and the chain-entry sequence at which the ack was attested in chain_log (so the index value is always traceable back to a hash-chained entry). Updated only by admission_gate as a side-effect of admitting a drain-ack-receipt entry; the update is sequenced strictly after chain-append commits. The index is an in-memory authoritative cache rebuildable by replay over chain_log if lost.",
+      "aspects": []
+    },
+    {
+      "id": "cert_assembler",
+      "node_type": "Subsystem",
+      "definition": "Assembles typed certificate-of-deletion entries on behalf of tenant_store. Receives the assembly trigger and the assembly inputs from tenant_store (per-store erasure attestations + drain-ack receipts) plus the audit-key DESTROYED log entry from lifecycle_gate. Looks up each input component in chain_log by entry-hash (verifying chain presence and provenance — which writer, which lease/policy_version, which broadcast HLC), classifies the resulting certificate as full-ack (all named writers acked, audit-key DESTROYED present), partial-with-witnesses (some writers timed out but witness records exist), or erasure-incomplete (preservation-blocked / drain-ack-handoff missing). Constructs the typed certificate-of-deletion record carrying machine-distinguishable typing and the verified-input hash list, and submits it to chain_writer for append. cert_assembler does not finalize tenant_store erasure — it only writes the certificate; tenant_store reads the certificate type to decide downstream actions.",
+      "aspects": []
+    },
+    {
+      "id": "schema_registry",
+      "node_type": "SubStore",
+      "definition": "In-process registry of currently-active entry-type schemas (operator-override admission, OOB-anchor use, anchor rotation, residency policy_version events, roster mutations, offboarding attestation, drain-fence broadcast-emit, drain-ack receipts, certificate-of-deletion variants, protocol-violation, per-tenant compliance events). Sourced from region_coordinator compliance_audit_owner subsystem at parent scope: a new schema version is published as a typed schema-version-activation entry that admission_gate observes from chain_log and applies to schema_registry. Reads expose (entry-type, version) -> schema; writes (schema activation) are sequenced strictly after the schema-activation chain entry is durably appended.",
+      "aspects": []
+    },
+    {
+      "id": "retention_enforcer",
+      "node_type": "Subsystem",
+      "definition": "Applies the jurisdiction-bound retention policy propagated through region_coordinator residency_publisher to chain_log entries. For each (residency, entry-type) pair holds the active retention window and on retention expiry crypto-shreds (or deletes ciphertext-only for Tier-1) entries past the bound, leaving Tier-2 witness, entry-hash, and prev-hash in place so chain integrity and structural-presence verification survive bulk retention-driven deletion. Retention-driven shred is itself logged as a typed entry into chain_log via chain_writer so post-shred a regulator can verify which entries were retention-shredded vs tenant-shredded vs surviving.",
+      "aspects": []
+    }
+  ],
+  "edges": [
+    [
+      "admission_gate",
+      "drain_ack_index",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "admission_gate",
+      "drain_ack_index",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "admission_gate",
+      "schema_registry",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "admission_gate",
+      "tier_splitter",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "admission_gate",
+      "chain_writer",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "tier_splitter",
+      "chain_writer",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "chain_writer",
+      "chain_log",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "chain_writer",
+      "chain_log",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "cert_assembler",
+      "chain_log",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "cert_assembler",
+      "chain_writer",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "retention_enforcer",
+      "chain_log",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "retention_enforcer",
+      "chain_writer",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "admission_gate",
+      "schema_registry",
+      {
+        "edge_type": "writes_to"
+      }
+    ]
+  ],
+  "requirements": [
+    {
+      "id": "r-init-late-write-rejection",
+      "targets": [
+        {
+          "Node": "admission_gate"
+        }
+      ],
+      "description": "compliance_audit must reject writes whose writer-encrypted-at-HLC exceeds the writer drain-ack-HLC for the same tenant as protocol violations at admission, and log the rejection itself; the shred mechanism applies only to entries that landed BEFORE the writer drain-ack-HLC.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "r-init-tier-witness",
+      "targets": [
+        {
+          "Node": "tier_splitter"
+        }
+      ],
+      "description": "Audit material is two-tier: TIER 1 (per-tenant audit-encryption key, shredded on tenant erasure) holds the tenant-attributable payload, TIER 2 (organizational long-lived OOB-anchor-rooted key, NOT shredded) holds a structural witness (event type, HLC, originating component, hash commitment to Tier-1 payload) with no tenant-identifying material; certificate-of-deletion vouches for Tier-2 witnesses post-shred.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "r-init-chain-shred-integrity",
+      "targets": [
+        {
+          "Node": "chain_log"
+        }
+      ],
+      "description": "Tenant audit-key destruction (crypto-shred) renders Tier-1 ciphertext unreadable but leaves the hash chain intact: prev-hash links, entry-hash, and Tier-2 witness all survive; an external verifier can still confirm chain integrity and structural-presence of every attested event for the tenant after shred.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "r-init-cert-of-deletion-typing",
+      "targets": [
+        {
+          "Node": "cert_assembler"
+        }
+      ],
+      "description": "cert_assembler emits typed certificate-of-deletion entries (full-ack / partial-with-witnesses / erasure-incomplete) over assembly inputs (per-store erasure attestations + drain-ack receipts + audit-key DESTROYED log entry), each input verified present in chain_log and provenance-tagged (writer, lease/policy_version, broadcast HLC); the certificate type is machine-distinguishable from full-ack.",
+      "origin": {
+        "type": "Initial"
+      }
+    }
+  ],
+  "satisfactions": [
+    {
+      "requirement_id": "r-init-late-write-rejection",
+      "explanation": "admission_gate definition specifies the inbound admission check: looks up (writer, tenant) drain-ack-HLC in drain_ack_index and rejects writes with writer-encrypted-at-HLC > drain-ack-HLC as protocol-violations; rejected writes still traverse chain_writer as protocol-violation entries (typed distinct from normal entries) so the rejection itself is auditable; index updates from drain-ack-receipt entries are sequenced strictly after chain-append commits so admission can never observe a drain-ack that is not also chain-attested."
+    },
+    {
+      "requirement_id": "r-init-tier-witness",
+      "explanation": "tier_splitter composes Tier-1 ciphertext (encrypted under tenant_store-owned per-tenant audit-encryption key via the encrypt-RPC; tier_splitter only consumes the active key handle) and Tier-2 structural witness (event type, HLC, originating component, hash commitment to Tier-1 payload) signed under the OOB-anchor-rooted organizational long-lived key. For non-tenant-keyed entries Tier-1 is empty/identity and Tier-2 carries the structural payload directly. Both Tier-1 ciphertext and Tier-2 witness are wrapped into a single chain-entry record passed to chain_writer."
+    },
+    {
+      "requirement_id": "r-init-chain-shred-integrity",
+      "explanation": "chain_log entry tuple is (sequence, prev-hash, entry-hash, schema_version, residency_version, Tier-1 ciphertext blob, Tier-2 structural-witness signed under organizational long-lived key); shred destroys readability of Tier-1 ciphertext blob only — entry-hash, prev-hash, and Tier-2 witness remain. External chain integrity verification reads only entry-hash and prev-hash columns; structural-presence verification reads Tier-2; both survive shred by construction."
+    },
+    {
+      "requirement_id": "r-init-cert-of-deletion-typing",
+      "explanation": "cert_assembler receives assembly trigger and inputs from tenant_store (per-store erasure attestations + drain-ack receipts) plus the audit-key DESTROYED entry from lifecycle_gate, looks each component up in chain_log by entry-hash to verify chain presence and provenance (writer, lease/policy_version, broadcast HLC), classifies the result as full-ack / partial-with-witnesses / erasure-incomplete with machine-distinguishable typing, and submits the typed certificate-of-deletion record to chain_writer for append."
+    }
+  ]
+}

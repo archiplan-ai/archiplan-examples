@@ -1,0 +1,1146 @@
+{
+  "problem": "Provide a multi-tenant API service that gives developers programmatic read access to on-chain data across Ethereum mainnet, Sepolia testnet, Bitcoin, and Cardano. The service exposes each chain's native JSON-RPC interface (passthrough), serves both current and historical/archive state, and pushes real-time chain events — new block headers, mempool/pending transactions (incl. Cardano via Ogmios local-tx-monitor), and watched-address activity — to clients over websockets. The service must deliver reorg-safe semantics (rollback notifications, finality), authenticate every request to a tenant via API key, and enforce per-key rate limits and quotas.",
+  "current_version": 10,
+  "versions": [
+    {
+      "id": 0,
+      "note": "Naive architecture: gateway + per-chain archive nodes + tenant store; 12 initial requirements all satisfied",
+      "from_session": null,
+      "created_at": "2026-05-01T18:01:40.941893+00:00"
+    },
+    {
+      "id": 1,
+      "note": "v1: stressed architecture — added edge / chain_router / fanout / address_index / auth_cache / usage_meter / metrics_store; chain nodes redefined as pools; 28 derived reqs satisfied; CRITICAL regime",
+      "from_session": 1,
+      "created_at": "2026-05-01T18:15:44.585516+00:00"
+    },
+    {
+      "id": 2,
+      "note": "v2: addressed multi-region & distributed-consistency stressors — added region_coordinator (global control plane: quota aggregation, throttle fast-path, canonical-tip quorum, residency policy, hybrid logical clock) and fanout_bus (explicit multiplex layer); redefined tenant_store (residency partitioning, single-writer-per-key + tombstoned revocations), auth_cache (throttle-flag precedence, bulk hydration), usage_meter (sub-second cross-region delta reporting), fanout (portable cursors, chain-derived ordering, canonical-tip from coordinator), chain_router (head observations to coordinator), edge (residency-aware routing, reconnect-storm hints), gateway (HLC, skew degraded mode), metrics_store (residency sharding); 13 derived reqs all satisfied",
+      "from_session": 2,
+      "created_at": "2026-05-01T18:33:22.218284+00:00"
+    },
+    {
+      "id": 3,
+      "note": "v3: addressed bubbled gateway requirements at root scope — redefined fanout (per-subscription consumer-rate feedback signal + batched subscribe), chain_router (per-method cost-class hint at submission time), auth_cache (versioned per-tenant throttle flag), edge (consumes per-region gateway health surface with per-Subrole liveness incl. fanout-suspended), usage_meter (tagged rejected-request signal with rejection reason); satisfied bubble-gateway-1..5. No new edges; K̄ unchanged at 1.62, P̄ unchanged at 0.68, regime CRITICAL",
+      "from_session": null,
+      "created_at": "2026-05-01T18:54:55.479352+00:00"
+    },
+    {
+      "id": 4,
+      "note": "v4: addressed Session 3 stressors (lifecycle / compliance / abuse) — 11 breaking, 38 derived reqs satisfied. Cert/secret-lifecycle modeled across all mTLS-bearing surfaces (rotation overlap + region-staggered gating); chain_router as canonicalization point with schema-skew quarantine + pool-drain + tip-freshness + per-(chain,fork) sub-pools + fork detection; fanout with mempool fairness (deterministic shuffle, no privileged early access, no co-located advantage), planned-rebind events, subscription progress heartbeats; tenant_store with plan-change tombstones, tenant_cluster identity, preservation holds, erasure tombstones, no-resurrection; auth_cache with cluster-flag fast-path; usage_meter with (tenant, plan_version, tenant_cluster) cost attribution + cluster aggregation; metrics_store with retention policy + immutable compliance audit trail; address_index with per-tenant tombstones; region_coordinator gating cert/origin/pool-rotations and coordinating offboarding teardown; gateway requiring edge-attestation (rejecting un-attested traffic), trust-ramp, plan-change-overage, per-(chain,fork) routing. K̄=1.62, P̄=0.68 unchanged; CRITICAL.",
+      "from_session": 3,
+      "created_at": "2026-05-01T19:13:49.744689+00:00"
+    },
+    {
+      "id": 5,
+      "note": "v5: renamed ChainNode type to ChainPool — type-rename refactor reflecting that the four chain pool nodes (eth_archive/sepolia_archive/btc_archive/ada_archive) are pools-of-replicas, not single nodes; type definition redefined to express pool-of-replicas semantics (mixed archive/pruned roles, fork sub-pools, drain protocol, tip-lag reporting, mTLS). proxies_to edge type signature auto-updated (Service -> ChainPool). No node ids, no edges, no requirement targets changed; nodes are still per-chain. K̄=1.62, P̄=0.68, CRITICAL — unchanged. MERGE_CANDIDATE jaccard=1.0 across the four pairs persists by design (per-chain identity preserved in queries).",
+      "from_session": null,
+      "created_at": "2026-05-01T19:20:51.235572+00:00"
+    },
+    {
+      "id": 6,
+      "note": "Direction 06: addressed 4 region_coordinator zoom-in bubbles at root. Redefined chain_router (auth-tagged head observations on cert-bearing surface for bubble-1, plus offboarding idempotency/SLO/preservation-blocked for bubble-4); auth_cache (deny-during-propagation pending markers for bubble-2); edge, gateway, usage_meter, metrics_store (residency policy_version pin/propagate/push-and-acknowledge with deny-by-default on missed ack for bubble-3); gateway, fanout, address_index, chain_router, usage_meter (offboarding-signal idempotency dedupe + attestation SLO + preservation-blocked terminal states for bubble-4).",
+      "from_session": null,
+      "created_at": "2026-05-02T10:59:05.922822+00:00"
+    },
+    {
+      "id": 7,
+      "note": "Direction 07: addressed 3 root-scope bubbles (no bubble-tip_quorum-1 was present at root — chain_router-1 carries the converged operator-credential concern). Redefined auth_cache for bubble-region_coordinator-5: pending-markers must carry originating-proposal-id and HLC expiry bound; markers without proposal-id are rejected; markers auto-clear at HLC expiry without explicit retraction; on apply commit, reconciliation matches by originating-proposal-id rather than by identity. Redefined region_coordinator for bubble-region_coordinator-6 and bubble-chain_router-1: (a) defined and enforced the parent-scope operator-credential authorization model — M-of-N signatures from distinct registered operator credentials drawn from a published credential roster, scheduled rotation, compromise-revocation that immediately removes the credential and invalidates in-flight override proposals bearing it, per-operator audit — backing every operator-override admitted anywhere in the system (chain_router pool_membership_manager override, tip_quorum override, drain_coordinator force-complete); (b) added an out-of-band cert-bootstrap surface enumerated in cert-inventory for emergency cert recovery when the inter-region channel cert has expired and consensus over the channel is unavailable, rooted in an out-of-band trust anchor (offline keys / hardware-rooted root-of-trust) distinct from the inter-region channel cert chain, requires human authorization under M-of-N with elevated threshold for cert re-rooting, and every recovery is audit-logged. Redefined chain_router for bubble-chain_router-1: every local operator-override admission path consumes region_coordinator's credential-roster, rejects proposals with off-roster credentials, refuses to commit after compromise-revocation invalidates any in-flight signature, and records signing operator identities. No new nodes, edges, or types; structural metrics unchanged. K̄=1.62, P̄=0.68, modularity=0.58, CRITICAL.",
+      "from_session": null,
+      "created_at": "2026-05-02T11:46:54.524512+00:00"
+    },
+    {
+      "id": 8,
+      "note": "v8 — Direction 10: Root Session 2 against v7. 13 stressors all breaking, 13 derived reqs all satisfied. Introduced first-class compliance_audit Store node (append-only hash-chained, isolated from operational write planes, residency-tagged, with crypto-shred mechanism for reconciling immutability vs tenant erasure); writers wired (region_coordinator, chain_router, gateway, fanout, address_index, usage_meter); writes_to edge type extended to allow Store as source so address_index can write directly. Redefined region_coordinator with 9 named subsystems including credential_roster (push-and-acknowledge, monotonic roster_version, HLC-bounded freshness, deny-by-default on stale/missed-ack, M-of-N-authorized roster mutations with OOB-anchor-rooted bootstrap), residency_publisher (M-of-regions quorum-witnessed CAS activation, residency-fenced minority partition mode, monotonic-per-(consumer, version) sticky deny-by-default), lifecycle_gate (single scheduler-of-record for cross-component lifecycle, sole originator of HLC+nonce-stamped offboarding signals signed under lifecycle-gate authority), cert_bootstrap (OOB anchor as M-of-N hardware-rooted quorum across distinct custodians with anchor-rotation procedure and availability test cadence), gateway_health_surface (monotonic freshness signal + cross-witnessing), compliance_audit_owner. Redefined chain_router (roster freshness window, version-rejection, fork-transition handshake to fanout, lifecycle_gate-scheduled drain, lifecycle_gate-signed offboarding); auth_cache (proposal-id construction tuple guaranteeing collision-freeness under HLC degradation); fanout (fork-transition rollback-before-forward-progress, lifecycle_gate-signed offboarding); gateway, edge, usage_meter (sticky deny-by-default on policy_version, lifecycle_gate-signed offboarding); address_index (lifecycle_gate-signed offboarding, audit writes); metrics_store (audit role removed). 4 stressors had concerns deferred to internal zooms (fanout state machine, region_coordinator zoom, tenant_store zoom, drain_coordinator zoom internals). NKP K̄=1.88 (up from 1.62), P̄=0.69 (up from 0.68), modularity=0.94 (up from 0.58); CRITICAL regime preserved. New hotspot: compliance_audit K=6 (expected — it is the audit hub).",
+      "from_session": 4,
+      "created_at": "2026-05-02T12:11:36.481984+00:00"
+    },
+    {
+      "id": 9,
+      "note": "v9 — Direction 12: Root Session 3 against v8. 13 stressors all BREAKING, 21 derived reqs all satisfied + 4 tenant_store bubbles satisfied. Lease-token plane introduced on region_coordinator (subsystem 10 lease_issuer): per-tenant single-writer lease tokens with HLC-bounded TTL, M-of-regions quorum-witnessed activation, OOB-anchor-rooted emergency re-bootstrap, HLC-stamped handoff-fence at tenant_store; tenant_store enforces uniform CAS-on-(record_version, lease_id) with three distinct deny classes (lease-stale, lease-superseded, residency-miss). Drain-fence-broadcast-and-ack protocol (lifecycle_gate originator): every named writer flushes in-flight audit writes for tenant T to compliance_audit then acks drain to tenant_store within HLC-bounded window; teardown-overlap sequencing (flush-then-ack-then-teardown or durable drain-ack-handoff record); bounded-batching + per-writer back-pressure for bulk-offboarding waves. Composite-cert assembly contract: tenant_store assembles per-store erasure attestations + drain-ack receipts + audit-key DESTROYED into typed certificate-of-deletion (full-ack / partial-with-witnesses / erasure-incomplete) written to compliance_audit. Two-phase clock-skew-bounded fence on audit-key destruction; compliance_audit late-write rejection at admission. Residency policy_version 2PC: PREPARE requires tenant_store quarantine-and-relocate-complete ack; tenant_store PREPARED-ORPHAN degraded mode on window expiry; abort idempotency on (tenant_key, V+1, attempt_id). Pre-warm hydration on cold-start for residency consumers (edge, gateway, usage_meter, metrics_store) — rate-limited per-region, monotonic-per-(instance_id, version). Roster rotation 2PC + cross-component uniform invalidation ordering (consumers consult region_coordinator's currently-active roster_version on every commit); compromise-revocation carries retroactive-as-of-HLC. Offboarding consumers maintain durable per-(offboarding_id, component_id) apply-state phase markers (RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL); never retract a drain-ack. lifecycle_gate broadcasts are self-contained credential bundles carrying signing roster_version; consumers verify against named not cached roster_version. Two-tier audit material on compliance_audit: TIER 1 per-tenant-key shredded; TIER 2 organizational-long-lived structural witness (event type, HLC, originating component, hash commitment to Tier-1 payload) under OOB-anchor key hierarchy; certificate-of-deletion vouches for Tier-2 witnesses post-shred. New edges: region_coordinator -> tenant_store (writes_to) for lease/handoff/2PC/abort records; tenant_store -> compliance_audit (writes_to) for erasure attestations and certificate-of-deletion. Eight nodes redefined: region_coordinator, tenant_store, compliance_audit, gateway, fanout, address_index, chain_router, edge, metrics_store, usage_meter. NKP K̄=1.94 (up from 1.88), P̄=0.72 (up from 0.69), modularity=0.94 (unchanged); CRITICAL preserved. Hotspots: compliance_audit K=7, region_coordinator K=5 — both natural hubs (audit fan-in, global control plane). Closes the root contract surface around tenant_store erasure / lease / residency-2PC / cross-component lifecycle invariants before plan generation. (from stress session 5)",
+      "from_session": 5,
+      "created_at": "2026-05-03T09:59:59.731288+00:00"
+    },
+    {
+      "id": 10,
+      "note": "v10 — Direction 20: Root Session 6 absorbed D18 chain_router bubbles. region_coordinator subsystem 6 (credential_roster) extended with on-demand named-roster lookup endpoint over the cert-bearing inter-region surface (documented serving-plane availability target, per-caller/per-region rate limits, bulk-wave-coalesced fetch under HLC-bounded budget tighter than per-tenant drain-fence ack window, lifecycle-gate-signed responses, read-only and outside the 2PC rotation flow), unblocking s2-named-roster-unknown-locally and s2-stale-roster-cache-during-bulk-offboarding inside chain_router. region_coordinator subsystem 8 (gateway_health_surface) extended to surface fork-transition-pending per (chain, fork). fanout root-level redefinition pins minimal fork-transition handshake-ack contract: durable per-(region, chain, fork-pair) ack of divergence point before chain_router admits forward-progress dispatch on the new fork; per-cursor monotonicity guarantee across the rollback-then-forward-progress sequence (rollback-event cursor < divergence-point cursor < first new-fork forward-progress cursor, no replay under handshake retry); fork-transition-pending visibility on gateway_health_surface; internal subscription rollback-and-rebind state machine explicitly deferred to a future fanout zoom (Direction 22 candidate). fanout drain-fence consumption updated to call the named-roster lookup endpoint on cache miss. No nodes/types/edges added; both bubbles satisfied via --redefine alone. No stress session run — constraint allows skip when redefinitions close both bubbles cleanly.",
+      "from_session": null,
+      "created_at": "2026-05-04T12:19:02.595294+00:00"
+    }
+  ],
+  "stress_sessions": [
+    {
+      "id": 1,
+      "against_version": 0,
+      "produced_version": 1,
+      "stressors": [
+        {
+          "id": "S-chain-crash",
+          "description": "A chain node (e.g. eth_archive) crashes or restarts; all traffic targeted at it fails until it returns",
+          "attractor": "Gateway returns errors and drops every open subscription for the failed chain; tenants on that chain experience correlated outage",
+          "breaking": true,
+          "solution": "Run each chain as a redundant pool of healthy nodes; the gateway routes through health-checked replicas and fails over transparently",
+          "derived_reqs": [
+            "R-chain-redundancy",
+            "R-chain-health"
+          ],
+          "affects": [
+            "eth_archive",
+            "sepolia_archive",
+            "btc_archive",
+            "ada_archive",
+            "gateway"
+          ]
+        },
+        {
+          "id": "S-deep-reorg",
+          "description": "A blockchain reorganises deeper than the typical 1-2 block depth (e.g. 6+ blocks on Ethereum, 50+ on Bitcoin, large rollback on Cardano), invalidating events the gateway has already pushed as confirmed",
+          "attractor": "Clients trust pushed events as confirmed; on deep reorg their derived state diverges from the canonical chain and they have no protocol-level way to discover or repair it",
+          "breaking": true,
+          "solution": "Track each chain's finality model explicitly; tag every event with confirmation depth and finality status; on reorg emit explicit rollback notifications and replay the new canonical events from the divergence point; allow subscribers to set per-stream confirmation thresholds",
+          "derived_reqs": [
+            "R-finality-model",
+            "R-reorg-replay",
+            "R-confirmation-threshold"
+          ],
+          "affects": [
+            "gateway",
+            "eth_archive",
+            "btc_archive",
+            "ada_archive"
+          ]
+        },
+        {
+          "id": "S-fanout-1m",
+          "description": "A surge to ~1M concurrent websocket subscribers on the public newHeads / newBlocks streams; a single gateway process cannot fan out at this scale",
+          "attractor": "Gateway saturates CPU and network bandwidth fanning out the same chain stream; new connections fail and latency for established subscribers grows; per-block delivery falls behind tip",
+          "breaking": true,
+          "solution": "Decouple subscription fanout from request handling: the gateway becomes a stateless edge that hands subscribers off to a horizontally-scalable fanout layer that takes one chain stream and multiplexes it to many subscribers via an internal pub/sub bus",
+          "derived_reqs": [
+            "R-fanout-scale",
+            "R-fanout-decoupled"
+          ],
+          "affects": [
+            "gateway"
+          ]
+        },
+        {
+          "id": "S-hotspot-address",
+          "description": "A popular contract or address (e.g. USDT) emits thousands of events per block, and many tenants subscribe to it; per-block matching against millions of address filters becomes the bottleneck",
+          "attractor": "Per-block matching dominates CPU, address-activity events become delayed, and per-tenant queues build up causing back-pressure across all subscriptions",
+          "breaking": true,
+          "solution": "Build a per-chain block-event index keyed by address; subscriptions register at the index and receive only their matched events; index is sharded across the fanout layer",
+          "derived_reqs": [
+            "R-event-index"
+          ],
+          "affects": [
+            "gateway"
+          ]
+        },
+        {
+          "id": "S-heavy-historical",
+          "description": "A tenant runs an unbounded historical query (e.g. eth_getLogs over 10M blocks, or a full archive scan) that ties up the chain node for minutes",
+          "attractor": "Single chain-node process saturated by one request; other tenants experience high latency or timeouts; tip-state requests starve behind the heavy query",
+          "breaking": true,
+          "solution": "Enforce per-tenant query cost budgets; isolate heavy/long-running historical queries onto a dedicated read-replica pool separate from the tip-state pool; reject or chunk over-budget requests",
+          "derived_reqs": [
+            "R-query-cost",
+            "R-historical-isolation"
+          ],
+          "affects": [
+            "gateway",
+            "eth_archive",
+            "sepolia_archive",
+            "btc_archive",
+            "ada_archive"
+          ]
+        },
+        {
+          "id": "S-tenant-store-outage",
+          "description": "tenant_store becomes unreachable (DB outage, network partition); without it the gateway cannot authenticate or rate-limit any request",
+          "attractor": "Every request rejected as unauthenticated; the entire service is down even though chain nodes are healthy and reachable",
+          "breaking": true,
+          "solution": "Cache active tenant credentials and rate-limit state inside (or close to) the gateway with explicit TTLs; degrade to read-only credential cache during outages and queue counter updates for replay; fail open under defined conditions only",
+          "derived_reqs": [
+            "R-auth-cache",
+            "R-degradation"
+          ],
+          "affects": [
+            "gateway",
+            "tenant_store"
+          ]
+        },
+        {
+          "id": "S-api-key-leak",
+          "description": "A tenant accidentally commits an API key to a public repo; an attacker exploits it for ~24h before the tenant notices and rotates",
+          "attractor": "Tenant gets a surprise bill or quota exhaustion; abuse is not detected proactively because traffic looks like normal usage",
+          "breaking": true,
+          "solution": "Support multiple active keys per tenant with hot rotation/revocation; detect anomalous per-key behaviour (geo, IP, request-pattern shift) and surface alerts; let tenants self-revoke",
+          "derived_reqs": [
+            "R-key-rotation",
+            "R-key-anomaly"
+          ],
+          "affects": [
+            "gateway",
+            "tenant_store"
+          ]
+        },
+        {
+          "id": "S-pending-tx-flux",
+          "description": "Mempool semantics differ across chains and create ambiguous pending-tx events: Bitcoin RBF (BIP-125) replaces a pending tx with a higher-fee one; Ethereum txs can be dropped or replaced; Cardano local-tx-monitor expires pending txs",
+          "attractor": "Clients build apps assuming pending-tx events are append-only; data-consistency bugs (double-counted incoming, ghost transactions) appear in their products",
+          "breaking": true,
+          "solution": "Define an explicit pending-transaction state machine (seen, replaced-by, dropped, confirmed) and emit state transitions; document per-chain semantics",
+          "derived_reqs": [
+            "R-pending-state-machine"
+          ],
+          "affects": [
+            "gateway",
+            "btc_archive",
+            "eth_archive",
+            "ada_archive"
+          ]
+        },
+        {
+          "id": "S-subscriber-resume",
+          "description": "A websocket client briefly loses its connection (network blip, deploy on its end); on reconnect it has missed an unknown number of events and has no protocol way to recover the gap",
+          "attractor": "Subscribers re-fetch state from RPC after every disconnect, duplicating cost and creating coverage gaps; clients implement ad-hoc deduplication that is often wrong",
+          "breaking": true,
+          "solution": "Each subscription stream tags every event with an opaque cursor; on reconnect, clients can request 'resume from cursor X' and the system replays missed events from a per-chain ring buffer with bounded retention",
+          "derived_reqs": [
+            "R-subscription-cursor"
+          ],
+          "affects": [
+            "gateway"
+          ]
+        },
+        {
+          "id": "S-ddos-unauth",
+          "description": "An attacker floods the public gateway endpoint with unauthenticated traffic, attempting to exhaust connection slots, TLS handshake CPU, and chain-node capacity behind it",
+          "attractor": "Legitimate tenants cannot connect; chain nodes are pummelled by upstream traffic; even if some traffic is rejected, tail latency degrades for everyone",
+          "breaking": true,
+          "solution": "Terminate untrusted public traffic at an edge layer (CDN/anycast LB) with WAF, IP rate limiting, and bot mitigation; require authenticated API key before any chain-node-bound work; apply backpressure on chain calls",
+          "derived_reqs": [
+            "R-edge-protection"
+          ],
+          "affects": [
+            "gateway"
+          ]
+        },
+        {
+          "id": "S-chain-hard-fork",
+          "description": "A supported chain hard-forks (Cardano era transition, Ethereum upgrade, Bitcoin soft fork that touches RPC); breaking changes appear in the chain's protocol, ledger schema, or RPC surface",
+          "attractor": "Streams go silent or return malformed data immediately after the fork; tenants page support; the system is unable to serve the new chain version without a coordinated rebuild",
+          "breaking": true,
+          "solution": "Track each chain's release calendar; pre-stage upgraded node/bridge versions for the fork epoch; run dual-version bridges across the upgrade window; advertise a protocol/schema version on each subscription so clients can negotiate",
+          "derived_reqs": [
+            "R-chain-upgrade",
+            "R-protocol-version"
+          ],
+          "affects": [
+            "ada_archive",
+            "eth_archive",
+            "sepolia_archive",
+            "btc_archive",
+            "gateway"
+          ]
+        },
+        {
+          "id": "S-region-outage",
+          "description": "The gateway is deployed in a single cloud region; a regional outage takes the entire service offline including all open websocket subscriptions and tenant_store reads",
+          "attractor": "Total outage; SLA breach; loss of tenant trust; recovery requires regional fail-over plans the system does not have",
+          "breaking": true,
+          "solution": "Multi-region active-active deployment with anycast/global LB; tenant_store replicated across regions; chain-node pools and subscription-fanout layer instantiated per region; clients reconnect into the surviving region transparently",
+          "derived_reqs": [
+            "R-multi-region",
+            "R-tenant-store-replication"
+          ],
+          "affects": [
+            "gateway",
+            "tenant_store"
+          ]
+        },
+        {
+          "id": "S-egress-runaway",
+          "description": "A heavy tenant pulls 100 TB/month of historical and websocket data; egress cost and chain-node compute become unbounded under their plan and revenue per tenant inverts",
+          "attractor": "Per-tenant cost vastly exceeds per-tenant revenue; finance discovers it after-the-fact; throttling is reactive and angers the customer mid-month",
+          "breaking": true,
+          "solution": "Measure per-tenant cost drivers beyond raw request count (chain-node CPU, response bytes, egress); attribute them to tenants; enforce plan-tier monthly cost ceilings with backpressure and clear pre-throttle warnings",
+          "derived_reqs": [
+            "R-cost-accounting",
+            "R-plan-ceilings"
+          ],
+          "affects": [
+            "gateway",
+            "tenant_store"
+          ]
+        },
+        {
+          "id": "S-tenant-observability",
+          "description": "Tenants need visibility into their own usage, error rates, latencies, and rate-limit headroom to trust the platform and debug their integrations; without it support tickets explode",
+          "attractor": "Support tickets dominate; tenants build out-of-band logging on their own infrastructure to reconstruct what happened, eroding the platform's value",
+          "breaking": true,
+          "solution": "Emit per-tenant usage, error, latency, and rate-limit metrics from the gateway and surface them through a tenant-facing metrics API and dashboard; retain at least 30 days of history",
+          "derived_reqs": [
+            "R-tenant-metrics"
+          ],
+          "affects": [
+            "gateway",
+            "tenant_store"
+          ]
+        },
+        {
+          "id": "S-byzantine-node",
+          "description": "A chain node returns false, stale, or fork-of-wrong-chain data due to compromise, client bug, or eclipse attack; the gateway has no cross-check and forwards the bad data to tenants",
+          "attractor": "Tenants build on incorrect data without warning; once discovered, trust in the platform collapses faster than the bad data can be revoked",
+          "breaking": true,
+          "solution": "Cross-check chain head and canonical data across multiple independent replicas (preferably with diverse client implementations); quarantine divergent replicas and alert; for high-value reads (e.g. eth_call against tip), require quorum agreement",
+          "derived_reqs": [
+            "R-chain-cross-check",
+            "R-client-diversity"
+          ],
+          "affects": [
+            "eth_archive",
+            "sepolia_archive",
+            "btc_archive",
+            "ada_archive",
+            "gateway"
+          ]
+        },
+        {
+          "id": "S-archive-disk-growth",
+          "description": "Archive nodes grow without bound (Ethereum archive >12 TB and rising, Bitcoin >700 GB, Cardano growing); over years storage cost dominates unit economics and operational risk (provisioning, DR, snapshots) grows",
+          "attractor": "Storage cost dominates per-chain unit economics; provisioning a new replica takes days; disaster recovery time grows; old data is rarely queried but retained at full hot-storage cost",
+          "breaking": true,
+          "solution": "Per-chain tiered storage: tip-state and recent history on fast hot storage, deep archive on cheaper cold storage with on-demand re-warming; complement archive replicas with pruned tip-only replicas for scaling tip-state reads independently of archive size",
+          "derived_reqs": [
+            "R-tiered-storage",
+            "R-pruned-replicas"
+          ],
+          "affects": [
+            "eth_archive",
+            "sepolia_archive",
+            "btc_archive",
+            "ada_archive"
+          ]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "against_version": 1,
+      "produced_version": 2,
+      "stressors": [
+        {
+          "id": "S-cross-region-quota-race",
+          "description": "Per-tenant quota and rate-limit counters in usage_meter and auth_cache are eventually consistent across regions; under bounded replication lag, a tenant intentionally fans traffic to two regions and exceeds the monthly cost ceiling by ~replication-lag * peak-rate before global state converges and throttling activates",
+          "attractor": "Adversarial or naive tenants get free overshoot equal to inter-region lag * burst capacity every billing cycle; revenue per heavy tenant inverts again because the ceilings agreed in S-egress-runaway don't actually bind across regions",
+          "breaking": true,
+          "solution": "Aggregate per-tenant counters through a region-aware accumulator that reconciles deltas across regions on a sub-second cadence; auth_cache flags a tenant as throttled the moment any region observes the global ceiling is crossed and that flag propagates ahead of fine-grained counters",
+          "derived_reqs": [
+            "R-global-quota-aggregation",
+            "R-throttle-flag-fast-path"
+          ],
+          "affects": [
+            "usage_meter",
+            "auth_cache",
+            "tenant_store",
+            "gateway"
+          ]
+        },
+        {
+          "id": "S-tenant-store-split-brain",
+          "description": "A cross-region partition of tenant_store lasts long enough that conflicting writes are accepted in two regions: a tenant adds a new key in region A while an operator revokes a (different or same) key in region B; on heal, naive last-write-wins or local-wins reconciliation leaves a revoked key briefly active or a freshly-issued key absent",
+          "attractor": "Authentication state diverges silently across regions; either an attacker exploits a 'still-active' revoked key, or a legitimate tenant's new key is rejected; trust in tenant_store as the canonical source erodes and operators add ad-hoc reconciliation runbooks",
+          "breaking": true,
+          "solution": "Model tenant_store writes as CRDTs or use a single-writer-per-key partition strategy with explicit conflict resolution; key revocations are tombstoned globally so any region's read returns a definitive revoked-state during partition; key adds are accepted only in the tenant's home region or coordinated via a global write quorum",
+          "derived_reqs": [
+            "R-tenant-store-conflict-resolution",
+            "R-revocation-tombstone"
+          ],
+          "affects": [
+            "tenant_store",
+            "gateway",
+            "auth_cache"
+          ]
+        },
+        {
+          "id": "S-cursor-cross-region",
+          "description": "fanout's per-chain ring buffer that backs subscription cursors is region-local; when a region fails or anycast moves a client mid-stream, the client reconnects into a region whose ring buffer never observed cursor X — it cannot honor 'resume from cursor X' even though R-subscription-cursor was satisfied region-locally",
+          "attractor": "Clients silently lose events at every region failover; the documented retention window is meaningless across regions; tenants build region-pinning workarounds that defeat the active-active design",
+          "breaking": true,
+          "solution": "Issue cursors that encode (region, chain, position) plus globally-meaningful coordinates (chain block number + intra-block offset, or a globally-monotonic sequence per chain stream); replay can be served by any region by reconstructing from the chain pool's history when the local ring buffer doesn't cover that coordinate",
+          "derived_reqs": [
+            "R-portable-cursor"
+          ],
+          "affects": [
+            "fanout",
+            "gateway"
+          ]
+        },
+        {
+          "id": "S-reorg-divergence-cross-region",
+          "description": "Per-region chain pools observe reorgs at slightly different times because they're independent replica sets; for ~chain-propagation-lag, region A advertises canonical head H_A while region B still advertises H_B (the pre-reorg tip). A client failover from A to B in that window receives events from B that A has already rolled back, breaking R-reorg-replay's contract that subscribers see one consistent canonical chain",
+          "attractor": "Subscribers reconnecting across regions perceive the chain as forking and re-merging; their derived state silently diverges; the platform's reorg-safety guarantee turns probabilistic at the multi-region boundary",
+          "breaking": true,
+          "solution": "Designate a globally-coordinated canonical-tip view per chain (e.g. through a finality coordinator that takes quorum across regional pools) so the canonical head and rollback events are advertised consistently to every region's fanout; subscribers reconnecting cross-region see one canonical timeline; regional pools are still consulted for replication and read traffic but not as canonical-tip authorities in isolation",
+          "derived_reqs": [
+            "R-cross-region-canonical-tip",
+            "R-cross-region-rollback-coherent"
+          ],
+          "affects": [
+            "fanout",
+            "chain_router",
+            "eth_archive",
+            "sepolia_archive",
+            "btc_archive",
+            "ada_archive"
+          ]
+        },
+        {
+          "id": "S-clock-skew",
+          "description": "Components in different regions rely on local wall-clock for rate-limit windows, cursor-issue ordering, and event timestamps. NTP outage or slow drift produces multi-second skew between regions; rate-limit windows shift, two clients connected via different regions disagree on event ordering, and finality timestamps no longer compare across regions",
+          "attractor": "Tenants observe non-monotonic timestamps and inconsistent rate-limit behaviour; debugging cross-region issues requires per-region clock reconciliation that the platform doesn't provide; some classes of bugs are fundamentally invisible to operators because their timestamps lie",
+          "breaking": true,
+          "solution": "Decouple ordering and bucketing from wall-clock: event ordering uses chain-derived sequencing (chain block + offset, or chain-stream sequence) rather than gateway timestamps; rate-limit windows use a coordinated logical clock or hybrid logical clock that bounds skew explicitly; expose clock-health as a service-level metric and treat skew above a threshold as a degraded mode",
+          "derived_reqs": [
+            "R-chain-derived-ordering",
+            "R-bounded-clock-skew"
+          ],
+          "affects": [
+            "gateway",
+            "fanout",
+            "usage_meter",
+            "auth_cache"
+          ]
+        },
+        {
+          "id": "S-data-residency",
+          "description": "An EU tenant signs a contract requiring their tenant data, request logs, and traffic stay in the EU jurisdiction; an enterprise tenant in a sanctions-sensitive jurisdiction has similar requirements. The current design replicates tenant_store globally and uses anycast routing to the nearest region, which can route an EU tenant's traffic through a US region and surface their tenant data in non-EU replicas",
+          "attractor": "Enterprise/regulated tenants either cannot use the platform or expose the operator to compliance liability; ad-hoc per-tenant region pinning grows into a fragile policy layer; auditors find data in regions the contract said it would not be in",
+          "breaking": true,
+          "solution": "Make residency a first-class tenant attribute: each tenant is pinned to a residency policy that constrains where their tenant_store partition replicates, where requests may be served, and where logs/metrics live. The edge enforces residency-aware routing (refuses to forward EU-pinned traffic to non-EU gateways); tenant_store partitions are residency-scoped instead of fully global; metrics_store and usage_meter are sharded by residency",
+          "derived_reqs": [
+            "R-residency-policy",
+            "R-residency-aware-routing"
+          ],
+          "affects": [
+            "tenant_store",
+            "edge",
+            "gateway",
+            "usage_meter",
+            "metrics_store"
+          ]
+        },
+        {
+          "id": "S-anycast-flap",
+          "description": "BGP/anycast withdrawal or re-announcement during a network event moves a client's TCP/TLS path from one region's edge to another mid-session. Live websocket and TLS connections terminate (anycast cannot preserve TCP state); thousands of clients reconnect simultaneously into the surviving regions and concentrate retry storms there",
+          "attractor": "A 1-2 minute anycast event becomes a 10-minute outage as the surviving regions absorb the entire fleet's reconnect storm; auth_cache miss rate spikes; chain_router and fanout suffer correlated load; subscribers eat the resume-from-cursor path en masse",
+          "breaking": true,
+          "solution": "Treat anycast moves as a first-class event: edge and gateway publish a session-handoff hint with regional affinity so reconnecting clients spread reconnects with jittered backoff into the regions that have residual capacity; fanout pre-warms ring buffers for likely failover regions; auth_cache supports reconnect-storm-aware bulk hydration paths",
+          "derived_reqs": [
+            "R-reconnect-storm-control"
+          ],
+          "affects": [
+            "edge",
+            "gateway",
+            "fanout"
+          ]
+        },
+        {
+          "id": "S-implicit-fanout-bus",
+          "description": "fanout's definition references an internal pub/sub bus that multiplexes one chain stream to many subscriber-handling instances, but the bus itself is not modeled as a node. It's a per-region SPOF: bus broker failure halts every subscription stream in that region, and bus partitioning silently fragments delivery; there is no health-check, capacity budget, or failover policy associated with it because it doesn't exist in the spec",
+          "attractor": "Region-level subscription outages whose root cause is invisible to the spec; on-call discovers the bus the hard way each time it fails; capacity planning and stress testing skip the bus because it's not on the map",
+          "breaking": true,
+          "solution": "Model the multiplex bus as an explicit fanout_bus Store/Service in the spec, with its own definition, health-check expectation, capacity budget, and failover behaviour; fanout reads_from / writes_to fanout_bus; the bus participates in regional health and stress reporting",
+          "derived_reqs": [
+            "R-fanout-bus-modeled"
+          ],
+          "affects": [
+            "fanout"
+          ]
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "against_version": 3,
+      "produced_version": 4,
+      "stressors": [
+        {
+          "id": "s3-tls-expiry",
+          "description": "TLS / mTLS certificates expire on the public edge or on internal hops (gateway↔chain_router, gateway↔fanout, region_coordinator inter-region channel, chain provider mTLS to upstream chain_archive). A rotation is missed or staged unevenly across regions; some replicas serve expired certs while clients pin or strict-validate.",
+          "attractor": "System drifts toward 'cert handling is whoever-deployed-it's job': each hop has its own ad-hoc rotation cadence, no single inventory of cert-bearing surfaces, and rotations land asymmetrically across regions. Failures masquerade as upstream chain outages because the gateway sees mTLS handshake errors that look identical to network faults. The attractor over time is region-asymmetric expiries during a maintenance window: surviving region carries traffic + degraded mTLS to chain pool = compound outage.",
+          "breaking": true,
+          "solution": "Introduce explicit secret-lifecycle modeling: (a) every mTLS / TLS-bearing surface in the spec is enumerated with a documented renewal cadence and an overlap window during which old + new certs are both accepted; (b) rotations are region-staggered (region_coordinator gates the rollout) so two regions can never expire in the same maintenance window; (c) cert / handshake errors are classified distinctly from upstream-chain network errors at gateway and chain_router so the on-call signal points at the right surface; (d) auth_cache and tenant_store internal channels are included, not just public edge.",
+          "derived_reqs": [
+            "R-cert-inventory",
+            "R-cert-rotation-overlap",
+            "R-cert-rotation-staggered",
+            "R-handshake-error-classification"
+          ],
+          "affects": [
+            "edge",
+            "gateway",
+            "chain_router",
+            "region_coordinator",
+            "eth_archive",
+            "sepolia_archive",
+            "btc_archive",
+            "ada_archive"
+          ]
+        },
+        {
+          "id": "s3-client-schema-drift",
+          "description": "A chain pool runs multiple client implementations (per R-client-diversity). A minor-version upgrade on one implementation introduces a non-breaking-but-observably-different JSON-RPC response field (extra field, renamed undocumented field, looser type, different ordering of debug_traceTransaction entries). Some replicas in the same pool now answer the same eth_getLogs / cardano-cli / btc-cli request with subtly different shapes. Tenants who diff responses across requests, or who hash response payloads for cache, see flapping.",
+          "attractor": "Each chain pool drifts toward a 'whichever replica answered last' regime: replicas in the same pool emit subtly different JSON shapes for the same RPC, and the gateway has no canonicalization layer. Tenants build implicit dependencies on whichever shape they happened to see first, so any rolling client upgrade becomes externally visible. Over time this couples internal upgrade cadence to tenant-side code releases and makes pool diversity (R-client-diversity) cost more than it pays for.",
+          "breaking": true,
+          "solution": "chain_router is the canonicalization point: every JSON-RPC response leaving a chain pool toward gateway is normalized against a per-chain canonical schema (declared optional fields stripped or sorted; types coerced; ordering rules applied) so the response shape is a function of (chain, RPC method, schema_version) and not of which replica answered. Schema-version skew within a pool is detected at chain_router (replica reporting a fresh shape is quarantined like a divergent-tip replica per R-chain-cross-check). Schema versions are part of the protocol-version surface (R-protocol-version) so tenants can pin and migrate explicitly.",
+          "derived_reqs": [
+            "R-response-canonicalization",
+            "R-schema-skew-quarantine",
+            "R-schema-version-surface"
+          ],
+          "affects": [
+            "eth_archive",
+            "sepolia_archive",
+            "btc_archive",
+            "ada_archive",
+            "chain_router",
+            "gateway"
+          ]
+        },
+        {
+          "id": "s3-plan-downgrade-race",
+          "description": "A tenant on a k/mo Pro plan downgrades to a /mo Starter mid-month. At the moment of downgrade the tenant has: (a) accumulated month-to-date cost above the new plan's monthly ceiling, (b) active websocket subscriptions exceeding Starter's concurrent-subscription cap, (c) in-flight long-RPC requests partitioned in the long-pool slot. Three regions process the downgrade asynchronously through tenant_store replication. Some regions still see the tenant as Pro while others see Starter. The throttle-flag fast-path (R-throttle-flag-fast-path) is monthly-ceiling-aware but the new lower ceiling has not been reconciled with already-spent cost.",
+          "attractor": "Plan changes drift toward 'eventual eventually consistent': different regions see different plans, in-flight subscriptions and long RPCs get killed unevenly, month-to-date cost is interpreted differently against the old vs new ceiling. Either tenants get billed under the higher plan after downgrading, or they retain Pro privileges in some region until next month, or active subscriptions get torn down without the consumer-rate-feedback signal explaining why. Edge case: tenant downgrades + region failover + spent>new_ceiling all in same minute = unpredictable enforcement.",
+          "breaking": true,
+          "solution": "Plan-change events are tombstoned and globally ordered like key revocations (R-revocation-tombstone), with an effective-from timestamp; until tombstone is observed in a region, that region keeps the old plan but tags every in-flight cost against (tenant, plan_version). region_coordinator reconciles month-to-date cost against the maximum of (active plan ceilings ever in effect this billing period) per a documented policy (charity policy: tenant pays the lower; strict policy: tenant pays each window at the plan in force at the time). Concurrent-resource caps (subscriptions, long-RPC slots) downgrade gracefully: existing-over-cap subscriptions are not killed, but new ones are rejected; gateway emits a structured 'plan-change overage' rejection reason via the rejected-request signal (bubble-gateway-5).",
+          "derived_reqs": [
+            "R-plan-tombstone",
+            "R-plan-version-cost-attribution",
+            "R-plan-downgrade-graceful"
+          ],
+          "affects": [
+            "tenant_store",
+            "auth_cache",
+            "usage_meter",
+            "gateway",
+            "region_coordinator",
+            "fanout"
+          ]
+        },
+        {
+          "id": "s3-replica-rotation-storm",
+          "description": "Operations team triggers a blue/green rotation across a chain pool (e.g. eth_archive: 8 archive replicas + 12 pruned replicas swapped in two waves over 30 minutes during low-traffic). At rotation cutover: tenants with persistent websocket subscriptions trigger reconnects, in-flight long-RPCs targeting retiring replicas need draining, fanout's per-pool head-stream subscriptions need re-binding, address_index re-warming is in flight, the canonical-tip quorum (R-cross-region-canonical-tip) loses members momentarily, and the schema-skew quarantine logic (R-schema-skew-quarantine) sees a fresh set of replicas voting.",
+          "attractor": "Rotation drifts toward 'rotate during quiet windows and pray': there is no per-pool drain protocol that bounds the cutover blast radius. Each rotation triggers a brief but compound spike — reconnect storm hint exists at edge (R-reconnect-storm-control) but is region-failover-tuned, not in-region-rotation-tuned; in-flight long-RPCs are killed; canonical-tip quorum size shrinks below the safe threshold; schema-skew quarantine flaps because new replicas vote with old ones. Worst case: rotation collides with a real chain reorg or with a region failover and the compound event is misdiagnosed.",
+          "breaking": true,
+          "solution": "chain_router runs an explicit pool-drain protocol: a replica entering 'draining' state stops receiving new requests, finishes in-flight RPCs (or returns them with a retryable-on-other-replica hint to gateway), and unsubscribes from fanout's head streams only after gateway-side subscriptions have been re-bound to a non-draining replica. region_coordinator gates pool-rotation events: only one pool, one region, one wave at a time; canonical-tip quorum members are held above the safe threshold throughout the rotation; rotation events are tagged so schema-skew quarantine ignores skew during the documented rotation window. fanout treats pool rotation as a 'planned head-stream rebind' event distinct from a network fault, so subscription cursors are not invalidated.",
+          "derived_reqs": [
+            "R-pool-drain-protocol",
+            "R-rotation-coordinator-gate",
+            "R-rotation-aware-skew",
+            "R-fanout-rebind-event"
+          ],
+          "affects": [
+            "eth_archive",
+            "sepolia_archive",
+            "btc_archive",
+            "ada_archive",
+            "chain_router",
+            "fanout",
+            "address_index",
+            "region_coordinator",
+            "gateway"
+          ]
+        },
+        {
+          "id": "s3-pool-sync-stall",
+          "description": "All replicas in one chain pool (e.g. ada_archive) fall behind the chain tip simultaneously — Cardano network has a transient incident, or the pool's I/O subsystem hits a bottleneck during a cold-storage rewarming, or a snapshot-restore on multiple replicas runs concurrently. Replicas are healthy (alive, responding) but their reported tip is hours stale. R-chain-cross-check passes (replicas agree with each other); the canonical-tip quorum (R-cross-region-canonical-tip) compares this region's stale tip with other regions' fresher tips. Tenants subscribed to head events on this chain see no rollbacks or events, but they also see nothing new — silent stall.",
+          "attractor": "System silently degrades into 'reading stale state without telling anyone'. Tip-state RPCs return correct-but-old answers; subscriptions hang quiet. Cross-region quorum may even mask the stall if the stalled region's vote is included. The attractor is a class of incident where the chain pool is observably alive on every health metric except the one that matters (tip-freshness vs upstream chain), and tenant-side queries (e.g. 'is this transaction confirmed?') silently return wrong answers.",
+          "breaking": true,
+          "solution": "Tip freshness is treated as a first-class signal independent of cross-replica agreement. chain_router compares each pool's reported tip to an external reference (peer regions' pools via region_coordinator, plus an out-of-band oracle: chain network's own peer count / slot-time advance) and emits a 'tip-stale' degraded mode when the pool falls behind a per-chain freshness budget. Quorum computation excludes votes from pools in tip-stale mode. Gateway annotates tip-state RPC responses with the pool's freshness state when stale; subscriptions emit a heartbeat 'no new tip' event when no chain progress is observed within the freshness budget so silence is not indistinguishable from healthy-but-quiet.",
+          "derived_reqs": [
+            "R-tip-freshness-budget",
+            "R-stale-pool-quorum-exclusion",
+            "R-stale-response-annotation",
+            "R-subscription-progress-heartbeat"
+          ],
+          "affects": [
+            "ada_archive",
+            "btc_archive",
+            "chain_router",
+            "fanout",
+            "region_coordinator",
+            "gateway"
+          ]
+        },
+        {
+          "id": "s3-mempool-frontrunning",
+          "description": "Two tenants subscribe to the same mempool / pending-tx stream on Ethereum (or pending-tx state-machine for Bitcoin / Ogmios local-tx-monitor on Cardano). Tenant A is a passive analytics user. Tenant B is an MEV searcher who will act on any pending tx they see. The fanout component delivers events to A and B with whatever ordering is implementation-convenient — possibly racing, possibly preferring whichever consumer-rate-feedback signal said it was hungrier (bubble-gateway-1). Tenant B observes a juicy tx that Tenant C also (separately, via private mempool) has just submitted, races C's tx, profits. Worse: a privileged backend with a co-located fanout subscription beats every public tenant by milliseconds.",
+          "attractor": "Mempool-stream fairness becomes whoever-pays-most-or-deploys-closest. Without a documented fairness model, the fanout consumer-rate feedback signal (bubble-gateway-1) becomes a covert priority knob. Co-located customers and internal services systematically beat external tenants. Reputational and regulatory exposure: 'this gateway provides front-running as a service' is a viable headline. The attractor is unintentional — the system never decided to be unfair, the unfairness is a side-effect of optimizing for consumer rate.",
+          "breaking": true,
+          "solution": "Mempool / pending-tx subscription delivery has an explicit, documented fairness model: per-event delivery order across subscribers is derived from a deterministic shuffling keyed on (event_id, subscription_id) with a fixed delay budget that bounds best-vs-worst delivery skew. fanout's consumer-rate feedback signal (bubble-gateway-1) becomes advisory only for mempool streams — the priority of a delivery is not a function of a tenant's hunger. Internal/admin subscribers receive mempool events on the same fairness regime as external tenants (no privileged early access). Tenants' subscription contracts on mempool streams document the fairness regime and the delay budget so 'this gateway is not a front-running facility' is a defensible position.",
+          "derived_reqs": [
+            "R-mempool-fairness",
+            "R-no-privileged-mempool-access",
+            "R-mempool-fairness-disclosure"
+          ],
+          "affects": [
+            "fanout",
+            "fanout_bus",
+            "gateway",
+            "chain_router",
+            "eth_archive",
+            "btc_archive",
+            "ada_archive"
+          ]
+        },
+        {
+          "id": "s3-signup-farm-abuse",
+          "description": "Adversary creates thousands of free-tier tenants programmatically (script + disposable email + rotating IPs / VPN / residential proxy network). Each tenant gets the free per-key quota; in aggregate they consume Pro-tier-equivalent throughput at zero cost. Variants: each tenant subscribes to mempool streams (free MEV signal), or watches the same address-set (cheap multiplexer abuse), or runs historical-archive reads at scale (high cost class). Edge protections (R-edge-protection) drop crude bots; this attack survives it because each tenant looks legitimate and stays under per-key limits.",
+          "attractor": "Free tier becomes a back-door to Pro-tier capacity. Per-tenant rate limits are correct in isolation but composable in the wrong direction: N tenants × free-quota = arbitrarily large. Cost-attribution at usage_meter is correct per tenant but no signal aggregates 'this cluster of tenants behaves as one entity'. The system has no concept of identity beyond the API key and the tenant; the real attacker is at a layer the spec does not model.",
+          "breaking": true,
+          "solution": "Introduce a tenant-cluster identity layer separate from tenant identity. usage_meter and edge feed signup metadata, source-network fingerprints, query-pattern vectors, and behavioral telemetry into a clustering process whose output is a 'tenant cluster id' attached to each tenant. Free-tier global quotas (per cluster, not per tenant) are enforced — the throttle-flag fast-path (R-throttle-flag-fast-path) extends to cluster-level throttle flags. Suspicious clusters (rapid signup velocity, residency mismatch with traffic origin, near-identical query patterns) are gated behind a graduated trust ramp: free tier starts with a low trust score, capacity unlocks with verified-attribute signals (paid card, captcha, domain ownership, age-of-tenant). Tenant-cluster suspensions are tombstoned and propagate the same way revocations do.",
+          "derived_reqs": [
+            "R-tenant-cluster-identity",
+            "R-cluster-level-quota",
+            "R-trust-ramp",
+            "R-cluster-suspension"
+          ],
+          "affects": [
+            "edge",
+            "gateway",
+            "tenant_store",
+            "auth_cache",
+            "usage_meter",
+            "fanout",
+            "address_index"
+          ]
+        },
+        {
+          "id": "s3-lawful-access",
+          "description": "A lawful-access request arrives: subpoena demands all tenant activity for tenant T over a date range. Variants: court order to preserve all logs related to a watched address; right-to-erasure (GDPR/CCPA-style) demands deletion of a tenant's traces — directly at odds with the preservation order; a regional regulator demands data not leave their jurisdiction (already covered by R-residency-policy). The system has tenant-cost data in usage_meter, query patterns in metrics_store, address-watch state in address_index, auth events derivable from auth_cache hydration logs, key-rotation history in tenant_store. Without a documented retention/preservation/erasure model, response is ad-hoc and likely either over-discloses (reveals other tenants), under-preserves (data already aged out), or violates residency.",
+          "attractor": "Compliance is treated as a legal-and-eng fire-drill per request rather than a property of the system. Engineering writes ad-hoc queries against logs and stores; results may include other tenants' data; preservation orders race against retention rotations and lose; erasure requests cannot prove the deletion is complete. The attractor over time: legal exposure compounds, engineering costs per request grow, and one mishandled subpoena either leaks third-party data or fails to comply.",
+          "breaking": true,
+          "solution": "Introduce a per-tenant data-subject view: every store that holds tenant-attributable data (tenant_store, usage_meter, metrics_store, address_index, auth_cache hydration log) supports a documented 'extract for tenant T' operation that returns only T's data, scoped to the residency policy in force. Retention policies are explicit per data class with documented minimum and maximum retention; preservation orders pin specific tenant data above its retention floor as a tombstoned hold record (cannot be deleted while held). Erasure requests are durable tombstones that propagate cross-region (like revocations) and produce a verifiable certificate of deletion across every store. Preservation-vs-erasure conflicts resolve under a documented policy (preservation wins, with disclosure to the data subject as legally permitted). All compliance operations are logged in an immutable audit trail.",
+          "derived_reqs": [
+            "R-data-subject-extract",
+            "R-retention-policy",
+            "R-preservation-hold",
+            "R-erasure-tombstone",
+            "R-compliance-audit-trail"
+          ],
+          "affects": [
+            "tenant_store",
+            "usage_meter",
+            "metrics_store",
+            "address_index",
+            "auth_cache",
+            "gateway",
+            "region_coordinator"
+          ]
+        },
+        {
+          "id": "s3-edge-bypass",
+          "description": "An attacker discovers a path to the gateway that bypasses edge: a regional load balancer's origin IP is leaked (DNS history, certificate transparency log, employee misconfig) and the attacker hits gateway directly. R-edge-protection assumes 'untrusted public traffic is filtered at edge'; bypassing edge means bot-mitigation, IP-based rate limit, WAF rules, and residency-aware routing are all skipped. Gateway sees what looks like internal traffic and applies softer defaults. Variants: a region drain leaves origin temporarily reachable; an internal tool's NAT egress IP is mistakenly added to gateway's allow-list; an SSRF in a sibling internal service routes attacker traffic to gateway from an internal-looking source.",
+          "attractor": "Edge becomes a soft perimeter that callers can step around. Gateway accumulates implicit trust assumptions ('if it got here, edge let it through'). Origin IPs, internal tooling allow-lists, and edge presence drift apart. The attractor is the assumption that defense-in-depth exists when only depth-of-defenses-at-the-edge actually exists. Worst case: bypassed traffic uses a stolen API key, residency policy is silently violated, and no signal at edge fires because edge never saw the traffic.",
+          "breaking": true,
+          "solution": "Gateway requires cryptographic edge-attestation on every inbound request: edge signs a short-lived token (rotated per R-cert-rotation-overlap, with edge as a cert-bearing surface per R-cert-inventory) carrying the request's residency tag, source-network classification, and edge-applied rate-limit verdicts; gateway rejects any request that does not carry a current valid attestation. Internal traffic that legitimately bypasses edge (health checks, control plane) is signed by a separate explicit identity, not implicit by network. Region drains, allow-list rotations, and internal-tooling egress IP changes are all events region_coordinator gates so a drain cannot silently expose origin. Origin endpoints periodically rotate (per R-cert-rotation-staggered) to neutralize leaked-IP windows.",
+          "derived_reqs": [
+            "R-edge-attestation",
+            "R-internal-traffic-explicit",
+            "R-origin-rotation"
+          ],
+          "affects": [
+            "edge",
+            "gateway",
+            "auth_cache",
+            "region_coordinator"
+          ]
+        },
+        {
+          "id": "s3-contentious-fork",
+          "description": "A supported chain undergoes a contentious hard fork (e.g. ETH PoW vs PoS, BCH-style split, an unplanned consensus split between client implementations within the chain's own ecosystem). After the fork, two chains exist with the same history up to block N and then diverge. Both have non-zero economic activity. R-chain-upgrade covers planned upgrades; this is different — there is no single 'official' continuation. R-chain-cross-check quarantines a divergent replica, but here divergence is not a bug — it's two legitimate chains. Tenants subscribed to addresses see events on both forks; tenants asking for canonical-tip via gateway need to know which fork they are getting.",
+          "attractor": "System silently picks one fork (whichever a majority of replicas happen to follow) and presents it as canonical. Tenants on either side of the split see surprising rollbacks: the rollback notification (R-cross-region-rollback-coherent) emits a divergence point that for one side of the split represents 'we abandoned your fork'. Without explicit fork-id support, the protocol-version surface (R-protocol-version) cannot distinguish 'tip on fork A' from 'tip on fork B'.",
+          "breaking": true,
+          "solution": "Introduce explicit per-chain fork identity: every chain has a documented set of supported forks identified by (chain_id, fork_id). chain_router tracks each replica's fork allegiance and partitions the chain pool by fork; replicas on different forks are not 'divergent' (R-chain-cross-check), they are members of different sub-pools. region_coordinator maintains a separate canonical-tip per (chain, fork). Tenants explicitly subscribe to or query a (chain, fork) pair; the protocol-version surface advertises supported forks. Operations decides which forks are supported and announces additions/removals; an unannounced contentious split surfaces a 'fork detected' alert with a documented operator-decision SLA before it becomes user-visible.",
+          "derived_reqs": [
+            "R-fork-identity",
+            "R-per-fork-canonical-tip",
+            "R-fork-detection-alert"
+          ],
+          "affects": [
+            "eth_archive",
+            "sepolia_archive",
+            "btc_archive",
+            "ada_archive",
+            "chain_router",
+            "fanout",
+            "region_coordinator",
+            "gateway"
+          ]
+        },
+        {
+          "id": "s3-tenant-offboarding-orphan",
+          "description": "A tenant offboards: they delete their account or the operations team terminates them for non-payment. The system invokes erasure (R-erasure-tombstone) and cluster-suspension (R-cluster-suspension) — these handle direct tenant data. But the tenant's runtime footprint extends further: persistent websocket subscriptions still occupy fanout state, watched-address entries are still in address_index counting against shared limits, in-flight long-RPC slots in the long-pool partition (bubble-gateway-2) still hold capacity, retention-managed metrics in metrics_store will linger until the next rotation. Without a coordinated offboarding teardown, deleted tenants leave a long resource shadow.",
+          "attractor": "Offboarding becomes 'mark deleted, hope it cleans itself up'. Subscriptions for offboarded tenants keep streaming events into a websocket that has no live consumer, address_index keeps watching addresses no one cares about, and capacity is consumed by ghost tenants. Compliance erasure looks complete on paper but the system still acts on the tenant's residual configuration. Worst case: offboarded but resurfaced via cluster-suspension being lifted, and old subscriptions reactivate with stale auth state.",
+          "breaking": true,
+          "solution": "Offboarding is a documented end-to-end teardown protocol coordinated by region_coordinator: erasure tombstone (R-erasure-tombstone) is the trigger; gateway closes all open websocket subscriptions for the tenant with a 'tenant-offboarded' close reason; fanout drops the tenant's subscriptions and emits a single accounting record; address_index removes the tenant's watch entries (with a tombstone if the same address is watched by other tenants — never deleting another tenant's watch); chain_router cancels any in-flight long-RPCs for the tenant; usage_meter freezes the tenant's cost record at offboarding time. Each component emits an offboarding attestation; the aggregate teardown attestation is part of the compliance audit trail (R-compliance-audit-trail). Resurrection of an offboarded tenant requires a new tenant identity — reactivation is not supported.",
+          "derived_reqs": [
+            "R-offboarding-teardown",
+            "R-no-tenant-resurrection",
+            "R-shared-watch-tombstone"
+          ],
+          "affects": [
+            "tenant_store",
+            "fanout",
+            "address_index",
+            "gateway",
+            "usage_meter",
+            "metrics_store"
+          ]
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "against_version": 7,
+      "produced_version": 8,
+      "stressors": [
+        {
+          "id": "s4-roster-unavailable",
+          "description": "region_coordinator's published operator-credential roster is unreachable, stale, or returning errors during an emergency override window. Without an authoritative roster, every M-of-N override admission point (chain_router pool_membership_manager, tip_quorum, drain_coordinator force-complete, lifecycle_gate offboarding force-complete) cannot validate signing credentials against the current set, and either denies all overrides at the worst time or admits without authoritative validation.",
+          "attractor": "Two divergent failure modes: (a) emergency-override-paralysis — every override admission denies because no roster is available to validate against; (b) over-permissive admission — local caches are accepted past freshness with no documented bound, so a stale roster admits a recently-revoked credential. Either way the architecture has no documented contract for roster-staleness tolerance vs the hard fail-closed boundary.",
+          "breaking": true,
+          "solution": "region_coordinator's roster publication contract must define: (1) a bounded local-cache freshness window during which consumers may admit overrides against a cached roster, after which they fall to deny-by-default; (2) the deny-by-default state during a roster outage must be explicit and uniform across chain_router, tip_quorum, drain_coordinator, lifecycle_gate; (3) staleness is HLC-bounded, not wall-clock-bounded; (4) revocation lookahead — consumers refuse to admit overrides whose roster_version is older than a per-component minimum even if the cache itself is fresh.",
+          "derived_reqs": [
+            "r-s4-roster-staleness-bound"
+          ],
+          "affects": [
+            "region_coordinator",
+            "chain_router"
+          ]
+        },
+        {
+          "id": "s4-oob-anchor-compromise",
+          "description": "Out-of-band trust anchor (offline keys / hardware root-of-trust) backing region_coordinator's emergency cert-bootstrap surface is compromised, lost, or unavailable. Compromise: an attacker can re-root certs and authorize cert recovery; no recovery path defined since the anchor was the recovery path of last resort. Unavailability during an inter-region channel-cert expiry window means recovery itself is unreachable: the system cannot recover its own ability to recover.",
+          "attractor": "Two terminal attractors: (a) compromised anchor admits attacker-controlled cert re-rooting under the OOB surface, with no second layer of detection or recovery — the architecture has no anchor-of-the-anchor; (b) unavailable anchor during a channel-cert expiry leaves the system unable to recover, sliding into permanent inter-region partition with no human-overrideable path back. Both are absorbing states.",
+          "breaking": true,
+          "solution": "Add an explicit OOB-anchor-recovery contract: (1) the OOB trust anchor is a quorum (M-of-N hardware-rooted material across geographically distinct custodians) so single-anchor compromise is detectable and revocable; (2) anchor-compromise is a distinct event class with a documented detection-and-revocation procedure: any single anchor element being compromised triggers anchor-rotation under the remaining quorum; (3) anchor-availability SLO defined: anchor reachability must be testable on a documented cadence so unavailability is detected before a cert-expiry window arrives; (4) every OOB anchor use writes a tamper-evident audit record (see s4-audit-trail-unmodeled). Anchor inventory is named at root scope as a region_coordinator concern; specifics live in region_coordinator zoom.",
+          "derived_reqs": [
+            "r-s4-oob-anchor-quorum"
+          ],
+          "affects": [
+            "region_coordinator"
+          ]
+        },
+        {
+          "id": "s4-roster-rotation-race",
+          "description": "An operator credential rotates (scheduled rotation) or is compromise-revoked between signature collection and CAS commit at one or more override-admission points. Multiple components (chain_router pool_membership_manager, tip_quorum, drain_coordinator, lifecycle_gate) may have in-flight proposals bearing the rotated/revoked credential at the same instant. The current spec says compromise-revocation 'invalidates in-flight override proposals bearing it' but does not specify cross-component invalidation ordering: a revocation may reach chain_router after tip_quorum, and an attacker could ride the gap.",
+          "attractor": "Eventual-consistency 'gap' attractor: an attacker holding a leaked credential that has just been revoked races to commit M-of-N proposals at the override-admission point that hasn't yet propagated the revocation. Attractor is a brief but non-zero window where revocation has not converged across all admission points; the system implicitly assumes simultaneous propagation but does not enforce it.",
+          "breaking": true,
+          "solution": "Define a uniform invalidation-ordering contract on region_coordinator: every roster update (rotation or compromise-revocation) carries a monotonic roster_version; admission points reject any signature whose roster_version is older than the current roster_version they hold AND require that, on revocation, the revocation_event is propagated through the same residency_publisher push-and-acknowledge channel pattern (deny-by-default on missed ack within window) as residency policy. The contract is named at root; per-component apply-and-rollback semantics for in-flight proposals belong in the relevant zooms.",
+          "derived_reqs": [
+            "r-s4-roster-revocation-propagation"
+          ],
+          "affects": [
+            "region_coordinator",
+            "chain_router"
+          ]
+        },
+        {
+          "id": "s4-policy-version-partition-skew",
+          "description": "Inter-region partition splits region_coordinator's residency policy_version coherence: minority region serves under old policy_version while majority activates a tighter version; consumers in each region pin different versions and treat the other side's traffic as version-mismatched. Versioned-records and deny-by-default cover within-region miss-of-ack, but a multi-region partition can leave a tenant whose canonical home region is on the majority side issuing requests through the minority's edge / gateway under an old version, with no agreement on which side is 'authoritative current'.",
+          "attractor": "Partition-shaped attractor: the minority side either serves under old policy (compliance violation) or denies all traffic under deny-by-default (availability collapse for tenants whose home is in the minority); both are bad. The architecture currently has no documented policy_version quorum or 'minority must self-fence' rule.",
+          "breaking": true,
+          "solution": "region_coordinator's policy_version activation is governed by the same M-of-regions quorum that produces canonical tip; a minority region that cannot reach quorum self-fences for residency-policy-sensitive operations rather than serving under the last-known version. Activation is a quorum-witnessed CAS on policy_version: a region that did not witness the activation (because it was on the partitioned-minority side) does not advance its policy_version and instead enters a documented 'residency-fenced' degraded mode: it denies-by-default residency-policy-tightening-sensitive paths but continues serving residency-neutral paths. The minority-fence contract is named at root scope.",
+          "derived_reqs": [
+            "r-s4-policy-version-quorum-fence"
+          ],
+          "affects": [
+            "region_coordinator",
+            "edge",
+            "gateway"
+          ]
+        },
+        {
+          "id": "s4-offboarding-key-collision",
+          "description": "Adversarial component (or compromised internal credential) replays an offboarding signal with a stolen idempotency key (offboarding_id, component_id, attempt_id). Or: two genuine offboarding workflows collide on (offboarding_id, component_id, attempt_id) because attempt_id is reused across restart. Current spec dedupes by tuple but does not say whether the tuple is signed/authenticated or how attempt_id is generated to be unique under restart.",
+          "attractor": "Attractor: idempotency-key replay surface is implicitly trusted; an attacker with intra-system access can either (a) re-trigger an offboarding (DoS via tenant-offboarded close on an active tenant) or (b) suppress a real offboarding by submitting a colliding (offboarding_id, component_id, attempt_id) tuple ahead of the legitimate one.",
+          "breaking": true,
+          "solution": "Two-part contract: (1) offboarding signals are authenticated — only region_coordinator can originate an offboarding signal, signed under its lifecycle-gate authority; receiving components reject offboarding signals lacking a current valid region_coordinator signature; (2) (offboarding_id, component_id, attempt_id) uniqueness is region_coordinator's responsibility, with offboarding_id chosen by region_coordinator (HLC-stamped + nonce so attempt_id reuse under restart cannot collide with a different offboarding_id). The signing/uniqueness contract belongs at root (region_coordinator); per-component idempotent-apply semantics are zoom-scope (chain_router, gateway, fanout zooms — the latter two not yet zoomed).",
+          "derived_reqs": [
+            "r-s4-offboarding-signal-auth"
+          ],
+          "affects": [
+            "region_coordinator",
+            "gateway",
+            "fanout",
+            "address_index",
+            "chain_router"
+          ]
+        },
+        {
+          "id": "s4-proposal-id-collision",
+          "description": "auth_cache reconciles pending markers by originating-proposal-id. If proposal-ids are HLC-derived alone, two regions under HLC-degraded-mode (skew above threshold) could mint colliding proposal-ids; reconciliation would either match the wrong proposal or silently mis-apply. There is no documented uniqueness construction for proposal-id under degraded HLC.",
+          "attractor": "Cross-region collision attractor: under HLC-skew-degraded mode, two regions independently mint a proposal-id from HLC time + counter that happen to coincide. The pending-marker reconciliation key was built for collision-free identity; under collision, region A's apply-commit clears region B's marker for an unrelated proposal.",
+          "breaking": true,
+          "solution": "proposal-id is constructed as the tuple (originating_region_id, hlc_at_origin, region_local_monotonic_counter, nonce) and must be globally unique by construction even under HLC degradation: the (region_id, monotonic_counter) pair guarantees collision-freeness even when hlc_at_origin coincides across regions. auth_cache's reconciliation matches on the full tuple, not on hlc alone.",
+          "derived_reqs": [
+            "r-s4-proposal-id-uniqueness"
+          ],
+          "affects": [
+            "region_coordinator",
+            "auth_cache"
+          ]
+        },
+        {
+          "id": "s4-audit-trail-unmodeled",
+          "description": "Every credentialed action — operator-override admission, OOB recovery, offboarding attestation, residency policy_version activation, roster rotation/revocation, anchor rotation, plus per-tenant compliance events (lawful-access record fetch, erasure tombstone) — is referenced as 'audit-logged' in component definitions but the audit log itself is not modeled at root: no node owns it, retention is unspecified, and tamper-evidence / append-only / integrity guarantees are not declared. metrics_store carries 'immutable compliance audit trail' from v4 but it does not appear to be a separate identity, and metrics_store is residency-sharded and operationally written by usage_meter — not a clean append-only audit substrate.",
+          "attractor": "Attractor: the audit trail diffuses into whichever store happens to be local to each event source (metrics_store for some, ad-hoc logs for others). Compliance audit becomes un-queryable as a coherent record; tamper-evidence is unprovable because the audit substrate is mutable in the same operational plane as the events it records (an attacker who compromises usage_meter can edit usage_meter's writes to metrics_store).",
+          "breaking": true,
+          "solution": "Introduce a first-class compliance_audit Store node: append-only, write-once with cryptographic chain (each entry hash-chains to predecessor), tamper-evident, retention policy declared, residency-tagged like other tenant-keyed surfaces, and isolated from the operational write planes of usage_meter / metrics_store. Every credentialed action defined above writes a typed audit record to compliance_audit. region_coordinator owns the schema; consumers (chain_router for override-admission, gateway/fanout/address_index/chain_router/usage_meter for offboarding attestation, region_coordinator itself for OOB-anchor use, residency activation, roster events) write directly. Pull metrics_store's 'immutable compliance audit trail' role out into compliance_audit so metrics_store is purely operational metrics.",
+          "derived_reqs": [
+            "r-s4-compliance-audit-substrate"
+          ],
+          "affects": [
+            "region_coordinator",
+            "metrics_store"
+          ]
+        },
+        {
+          "id": "s4-fork-transition-subscription",
+          "description": "chain_router partitions a chain pool by replica fork allegiance into per-(chain, fork) sub-pools; fanout maintains per-(chain, fork) sub-pool subscriptions and emits 'planned rebind' on chain-pool rotation. But during a fork-detection event itself (sub-pool membership changes mid-operation), an active subscription threaded with (chain, fork=A) may have observed events from a replica that just defected to (chain, fork=B); the subscriber sees a partial-fork view. Whether the subscriber sees a coherent rollback (events back to the divergence point, then forward on chosen fork) or a partial-fork view (silent skip across forks) is implicit.",
+          "attractor": "Attractor: in the absence of a fork-transition handshake between chain_router (sub-pool membership) and fanout (subscription state), subscribers either (a) silently skip across forks under fanout's planned-rebind machinery, blurring fork boundaries; or (b) see duplicated events around the fork-detection point; or (c) see no rollback notification when their subscribed fork was the losing fork. Reorg-safe semantics — a parent-scope initial requirement — are partially undermined.",
+          "breaking": true,
+          "solution": "Define a fork-transition coordination contract that pins reorg-safe semantics across the chain_router/fanout boundary: when chain_router's fork-detection emits a 'fork-detected' alert AND a sub-pool repartition follows, fanout MUST emit a structured rollback notification to subscribers on the losing fork (events back to the divergence point) before any forward-progress events on the new fork are delivered. The cross-component contract is named at root; the chain_router fork-detection handshake protocol and the fanout subscription rollback-and-rebind state machine are zoom-scope concerns of chain_router and (eventually) fanout zooms respectively. DEFERRED: fanout has not been zoomed yet — this becomes a follow-up to zoom fanout.",
+          "derived_reqs": [
+            "r-s4-fork-transition-rollback-contract"
+          ],
+          "affects": [
+            "chain_router",
+            "fanout"
+          ]
+        },
+        {
+          "id": "s4-policy-ack-thrash",
+          "description": "A residency policy_version is in the process of tightening; consumer (gateway/edge/usage_meter/metrics_store) acks arrive just-late-enough to repeatedly oscillate between 'in-window ack received' and 'missed ack -> deny-by-default'. A flapping consumer causes flapping availability on the producer side because deny-by-default flips back and forth as acks straggle in. Spec defines deny-by-default on missed ack but not anti-thrash semantics.",
+          "attractor": "Flapping attractor: at the activation boundary, the consumer's ack arrival straddles the activation deadline so within a single activation it is in-window then out-of-window then in-window across rapid retries, and the producer-side deny-by-default flips at the same cadence. Tenant traffic experiences oscillating partial availability.",
+          "breaking": true,
+          "solution": "Anti-thrash contract on region_coordinator's residency_publisher: ack state is monotonic per (consumer, policy_version) — once a consumer has missed the activation window for a policy_version, the consumer is treated as deny-by-default for that version until it ack-readys to a strictly newer version; late-arriving acks do not flip the producer-side decision back. The producer-side state machine and the documented activation-window semantics live at root (region_coordinator). Per-consumer ack debounce / pre-warm protocol is a consumer-zoom concern (gateway, edge, usage_meter, metrics_store — most not yet zoomed), DEFERRED to follow-up directions.",
+          "derived_reqs": [
+            "r-s4-policy-ack-monotonic"
+          ],
+          "affects": [
+            "region_coordinator",
+            "edge",
+            "gateway",
+            "usage_meter",
+            "metrics_store"
+          ]
+        },
+        {
+          "id": "s4-health-surface-lying",
+          "description": "edge routes around a region whose gateway-health surface is degraded (fanout-suspended vs rpc-healthy). What if the health surface itself is the thing that's broken — false-healthy (region is actually degraded but reports healthy, so edge keeps sending traffic) or false-degraded (region is actually fine but reports degraded, so edge stops sending traffic and concentrates load on the others)? Currently the surface is 'sourced via region_coordinator' but the integrity / liveness contract on the surface itself is implicit.",
+          "attractor": "Two attractors: (a) false-healthy: a region's gateway is fanout-suspended-but-reports-healthy, edge continues to bind subscribers there, subscribers experience silent stalls; (b) false-degraded: a healthy region reports degraded, edge concentrates load on remaining regions, surviving regions saturate, cascading failure. The surface is currently treated as authoritative without a documented liveness or independent corroboration mechanism.",
+          "breaking": true,
+          "solution": "The gateway-health surface published via region_coordinator must (a) carry a heartbeat / monotonic-version freshness signal so a stuck-good or stuck-bad surface is detectable as stale and edge falls back to a documented stale-surface policy; (b) be cross-witnessed by an independent path (e.g. region-coordinator's tip_quorum already gathers per-region observations from chain_router; the same multi-region observation pattern can corroborate gateway health) before edge acts on a 'degraded' classification. Specific freshness window, the cross-witness construction, and the stale-surface fallback are region_coordinator zoom concerns. DEFERRED to region_coordinator zoom as a follow-up direction.",
+          "derived_reqs": [
+            "r-s4-gateway-health-integrity"
+          ],
+          "affects": [
+            "region_coordinator",
+            "edge",
+            "gateway"
+          ]
+        },
+        {
+          "id": "s4-drain-lifecycle-coordination",
+          "description": "drain_coordinator (chain_router internal) and lifecycle_gate (region_coordinator internal) both schedule operations against shared component pools. drain_coordinator schedules replica drains for chain pools; lifecycle_gate schedules cert/origin/pool-rotations and offboarding teardown across the system. They can each issue conflicting force-complete or block-pending operations against the same chain_router/chain pool target — e.g. a tenant offboarding triggers in-flight long-RPC cancellation on chain_router while drain_coordinator is mid-rotation drain on the same replica. End-to-end ordering and mutual-exclusion contract is implicit.",
+          "attractor": "Conflicting-schedule attractor: drain_coordinator and lifecycle_gate each commit against the same target without a parent-mediated lock, leading to (a) operation interleaving that produces preservation-blocked terminal states for offboarding when actually it was a transient drain race; or (b) drain reverses lifecycle_gate's rotation gating because both commit to the same replica state machine independently.",
+          "breaking": true,
+          "solution": "The cross-zoom coordination contract belongs at root scope: region_coordinator's lifecycle_gate is the single scheduler-of-record for cross-component lifecycle operations (cert/origin/pool-rotation, offboarding teardown); chain_router's drain_coordinator subscribes to lifecycle_gate's schedule and schedules replica-level drain only inside windows lifecycle_gate has reserved against the same target. Specifics of the mutex/lease protocol and per-replica state machine live inside the chain_router zoom (drain_coordinator) and region_coordinator zoom (lifecycle_gate) respectively. DEFERRED to both zooms; the at-root contract is the lease-vs-schedule directionality and the single-scheduler-of-record principle.",
+          "derived_reqs": [
+            "r-s4-lifecycle-scheduler-of-record"
+          ],
+          "affects": [
+            "region_coordinator",
+            "chain_router"
+          ]
+        },
+        {
+          "id": "s4-audit-vs-erasure",
+          "description": "Once compliance_audit exists as append-only/hash-chained (s4-audit-trail-unmodeled), it must record audit entries that reference tenant identity for offboarding attestation, lawful-access fetch, plan-change events, etc. But tenant erasure-tombstones are already a v4 contract (no-resurrection, erasure-tombstone). Append-only-with-hash-chain CANNOT simply delete an entry without breaking the chain; yet leaving tenant-identifying material in an immutable audit log violates erasure obligations. The two contracts collide and there is no documented resolution.",
+          "attractor": "Two-horned attractor: (a) honor erasure -> chain-break -> tamper-evidence broken; (b) honor immutability -> erasure violated -> compliance violation. Neither is acceptable; the architecture as currently described slides toward whichever is most operationally convenient, undermining the explicit guarantees on both sides.",
+          "breaking": true,
+          "solution": "Resolve via key-encapsulation: compliance_audit stores tenant-identifying material as ciphertext under a per-tenant audit-encryption key held in a separately-modeled key-management surface; the hash chain covers the ciphertext and the entry skeleton; on tenant erasure, the per-tenant audit-encryption key is destroyed (crypto-shred), rendering historical entries unreadable while leaving the chain intact and tamper-evidence preserved. The crypto-shred contract is region_coordinator's responsibility; the per-tenant audit-encryption-key lifecycle (issuance, rotation, destruction-on-erasure) is a tenant_store concern (deferred follow-up to tenant_store zoom).",
+          "derived_reqs": [
+            "r-s4-audit-crypto-shred"
+          ],
+          "affects": [
+            "region_coordinator",
+            "tenant_store"
+          ]
+        },
+        {
+          "id": "s4-credential-issuance-provenance",
+          "description": "region_coordinator's published operator-credential roster is the authoritative set of valid operator credentials. Rotation and compromise-revocation are documented; issuance-onto-the-roster is not. How does a new operator credential get onto the roster? Self-attestation by an existing operator under M-of-N? Out-of-band human ceremony rooted in the same OOB trust anchor? An attacker who can add credentials to the roster bypasses every M-of-N override admission downstream.",
+          "attractor": "Implicit-issuance attractor: roster mutations (add) bypass the same authorization rigor that override-admission downstream is granted. A single insider with publish access to region_coordinator's roster can mint a synthetic operator credential, then immediately satisfy M-of-N as one of the M signers in collusion with M-1 others (or with M-1 valid signers under social pressure).",
+          "breaking": true,
+          "solution": "Roster-mutation contract: every roster mutation (issue, rotate, revoke) is itself M-of-N-authorized under the same operator-credential authorization model, with elevated threshold for ISSUE (consistent with OOB-anchor cert-rooting elevation), and is rooted in the OOB trust anchor for the FIRST operator credential and any roster-bootstrap event (cold-start, full revocation event). Every roster mutation writes to compliance_audit. Specific bootstrap ceremony / quorum thresholds for the various mutation classes are region_coordinator zoom concerns; the at-root contract is the recursive M-of-N principle and the OOB-anchor rooting of bootstrap.",
+          "derived_reqs": [
+            "r-s4-roster-mutation-authorization"
+          ],
+          "affects": [
+            "region_coordinator"
+          ]
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "against_version": 8,
+      "produced_version": 9,
+      "stressors": [
+        {
+          "id": "s5-lease-issuer-unavailable",
+          "description": "region_coordinator's lease-issuance plane is partitioned from tenant_store and writers for a window longer than the HLC-bounded TTL on currently-issued lease tokens; without a documented unavailability contract, writers either continue past TTL under last-known-good lease (split-brain on partition heal) or fall to total deny (regional outage on every issuer-plane glitch); 'lease-stale' is not currently distinguished from 'residency-miss' in writer deny semantics, so recovery paths conflate.",
+          "attractor": "Without an explicit lease-issuer availability contract and a distinct 'lease-stale' deny class, the system is pushed toward one of two failure modes: (a) writers keep accepting under their last-known-good lease past HLC-TTL, producing split-brain when the partition heals (two writers' updates survive for the same tenant key in the home region); (b) writers fall to total deny on lease-stale and there is no recovery short of issuer-plane recovery, turning every issuer-plane partition into a regional write outage. Operationally the system also collapses 'lease-stale' into 'residency-miss' so on-call signal can't distinguish lease-issuer health from residency-publisher health.",
+          "breaking": true,
+          "solution": "region_coordinator's lease-issuance plane gets a documented availability and recovery contract analogous to residency_publisher: M-of-regions quorum-witnessed lease issuance and renewal, OOB-anchor-rooted emergency lease re-bootstrap when all issuer regions are simultaneously unavailable, and an issuer-plane availability target distinct from the inter-region channel itself. Writers continue under their currently-valid lease until HLC-bounded TTL; past TTL they sticky-deny-by-default for the affected tenant with a distinct 'lease-stale' deny reason (separate from 'residency-miss'). The two deny classes do not collapse: 'residency-miss' is resolved by a fresh policy_version ack from residency_publisher, 'lease-stale' is resolved only by a fresh lease issuance from lease_issuer; conflating them would attempt the wrong recovery path. Operator and tenant-facing surfaces report the deny reason explicitly so on-call signal points at the right subsystem.",
+          "derived_reqs": [
+            "r-s5-lease-issuance-availability",
+            "r-s5-lease-stale-distinct-deny"
+          ],
+          "affects": [
+            "region_coordinator",
+            "tenant_store",
+            "usage_meter"
+          ]
+        },
+        {
+          "id": "s5-lease-handoff-cas-race",
+          "description": "Old writer holds lease_v_old whose HLC-bounded TTL has not yet expired; intra-region failover causes lease_issuer to issue lease_v_new to a successor writer at HLC t_handoff < t_old_TTL. Both writers concurrently submit writes for the same tenant key. Without a uniform CAS rule across tenant_store sub-nodes (and across external reader-hydration paths in auth_cache and usage_meter), tenant_store may admit the old-lease write on CAS-on-record (record-version compare-and-swap that ignores lease identity) and external readers observe whichever write committed first, not the lease-correct one. Distinguished from S1: here the issuer is healthy, the partition is intra-region, both writers have valid TTL.",
+          "attractor": "Without uniform CAS-on-(record_version, lease_id) and a handoff-fence at tenant_store, the system is pushed toward last-write-wins between two TTL-valid writers: the older writer's write may commit at tenant_store after the new-lease write, overwriting it; auth_cache hydration log records whichever ordering happened to land first; usage_meter's per-tenant counter delta absorbs both writes (double-count) or only one (lost write). External readers see an inconsistent (record_version, lease_id) tuple where lease_id is older than the most recent lease_v_new even though TTL was valid at submit time.",
+          "breaking": true,
+          "solution": "Uniform CAS-on-(record_version, lease_id) at tenant_store: every write under a lease MUST present (record_version, lease_id), and tenant_store rejects any write whose lease_id is older than the most recent lease_id observed for that tenant key, even if the writer's TTL is still valid. Lease handoff is an HLC-stamped event written to tenant_store before lease_issuer is permitted to ack lease_v_new to the successor: lease_issuer waits for tenant_store's handoff-recorded ack as a fence (so old writer's TTL-valid write submitted after the fence sees a 'lease-superseded' deny). Old writer's deny reason is 'lease-superseded' (a third deny class distinct from 'lease-stale' and 'residency-miss', because the writer's TTL is still valid but a more recent lease has fenced it). External reader paths (auth_cache hydration, usage_meter cost attribution) read tenant_store's record with its (record_version, lease_id) tuple intact; reader-side ordering inherits the writer-side fence.",
+          "derived_reqs": [
+            "r-s5-lease-cas-uniform",
+            "r-s5-lease-handoff-fence-ack",
+            "r-s5-lease-superseded-deny"
+          ],
+          "affects": [
+            "region_coordinator",
+            "tenant_store",
+            "usage_meter",
+            "auth_cache"
+          ]
+        },
+        {
+          "id": "s5-drain-fence-teardown-deadlock",
+          "description": "A write-plane node (gateway, fanout, address_index, chain_router, usage_meter) is itself in lifecycle teardown (operator-initiated rolling restart, region-evacuation, or own offboarding via lifecycle_gate against the node, not the tenant) at the moment it receives a drain-fence broadcast for tenant T. Without a documented ack-or-block contract for this overlap, the node may shut down without acking, or ack-with-residual-buffer (its in-flight audit writes survive its own death and land at compliance_audit after t_destroy), or block its teardown indefinitely waiting to drain. compliance_audit's composite-cert assembly cannot wait forever; tenant_store cannot finalize erasure attestation if any writer never acks.",
+          "attractor": "Without an explicit ack-or-block-with-fallback contract, the system is pushed toward indefinite block: tenant_store waits for acks from a node already torn down whose successor instance has no record of the in-flight audit writes; the offboarding HLC window expands beyond its bound; compliance_audit's composite-cert assembly stalls. Alternative attractor: writers ack-then-die-with-residual, in-flight audit writes appear at compliance_audit after t_destroy under a now-destroyed audit key, breaking the audit-key destruction protocol's freshness assumption (S6 territory). Operator pressure under deadlock leads to override admissions that bypass acks and produce unverifiable composite-certs.",
+          "breaking": true,
+          "solution": "Cross-component ack-or-block protocol with a documented teardown overlap rule: every write-plane node receiving a drain-fence broadcast for tenant T MUST either (a) flush all in-flight audit writes for T, ack to tenant_store, then proceed with its own teardown — flush-then-ack-then-teardown is the only ordering that keeps both invariants — or (b) if it cannot flush within its remaining teardown window, write a 'drain-ack-handoff' record naming a successor instance or persistent buffer that owns the residual writes, ack-by-handoff to tenant_store, and lifecycle_gate's teardown gate is held until the handoff record is durable. lifecycle_gate is the single scheduler-of-record arbitrating the overlap: when both a per-tenant drain-fence and a per-node teardown target the same node, lifecycle_gate sequences them (drain-fence-flush BEFORE node-teardown) and refuses to admit a node-teardown that has not first acked all in-flight per-tenant drain-fences. tenant_store's HLC-bounded ack window gets a 'handoff-pending' state that converts a missing direct ack into an ack-by-handoff and the composite-cert records both. No silent drop, no unbounded wait.",
+          "derived_reqs": [
+            "r-s5-drain-fence-protocol",
+            "r-s5-drain-fence-teardown-overlap"
+          ],
+          "affects": [
+            "region_coordinator",
+            "tenant_store",
+            "gateway",
+            "fanout",
+            "address_index",
+            "chain_router",
+            "usage_meter"
+          ]
+        },
+        {
+          "id": "s5-drain-fence-broadcast-storm",
+          "description": "A bulk operator action offboards many tenants (10^4-10^5) near-simultaneously. region_coordinator's lifecycle_gate must broadcast a drain-fence for each tenant; the ack fan-in (6 writers × N tenants) saturates region_coordinator's inbound queues. The HLC-bounded ack window for any single tenant's drain-fence is at risk because operator-load CPU contention slows the broadcast pipeline. Without bounded-batching and back-pressure on the ack channel, either ack windows expire (false ack-by-handoff), broadcasts are dropped (silent drain-fence loss), or region_coordinator becomes unresponsive to the rest of the system.",
+          "attractor": "Under unbounded broadcast and unbounded ack fan-in, region_coordinator's queue-depth grows; HLC-stamped broadcast-emit times slip past the ack window, producing systemic ack-by-handoff (every offboarding becomes 'best-effort'); compliance_audit's certificate-of-deletion quality degrades to all-handoff records; lifecycle_gate's lifecycle-of-record lock is held for the duration of the storm and blocks all other lifecycle ops (cert rotations, residency activations, pool drains).",
+          "breaking": true,
+          "solution": "lifecycle_gate batches drain-fence broadcasts: bulk-offboarding requests are admitted into bounded-size waves with documented max-tenants-per-wave and inter-wave spacing such that per-wave ack fan-in stays within region_coordinator's documented ack-throughput target. Writers consume drain-fences from a per-writer bounded queue with explicit back-pressure: when a writer's ack queue is at capacity, it back-pressures lifecycle_gate which stalls further wave admission for that writer (rather than dropping broadcasts or expiring HLC windows). The HLC-bounded ack window is per-tenant and starts from the ack-broadcast-emit-HLC, not from the bulk operator action's HLC, so per-tenant windows do not collapse under bulk-load arrival smearing. Bulk-offboarding admission is itself audited and operator-visible.",
+          "derived_reqs": [
+            "r-s5-drain-fence-bounded-batching"
+          ],
+          "affects": [
+            "region_coordinator",
+            "gateway",
+            "fanout",
+            "address_index",
+            "chain_router",
+            "usage_meter",
+            "tenant_store"
+          ]
+        },
+        {
+          "id": "s5-composite-cert-partial-ack-loss",
+          "description": "One writer's drain-ack to tenant_store is lost in transit (network drop, transient congestion). Without explicit retry/timeout policy and a documented fail-mode, three pathologies emerge: (a) no retry — composite-cert is permanently incomplete and tenant_store cannot finalize; (b) unbounded retry — the offboarding HLC window expands past its bound, lifecycle_gate's per-wave admission stalls; (c) silent best-effort — composite-cert finalizes without the missing ack and the certificate of deletion claims a coverage it does not have, breaking the verifiable-composite contract from bubble-tenant_store-4.",
+          "attractor": "Without an explicit retry-budget + bounded-extension policy and a documented witness-fallback fail-mode, the system is pushed toward either chronic incomplete-cert (every offboarding stuck behind one slow writer) or chronic best-effort cert (every certificate is partial, undermining their evidentiary value). Operator pressure under stuck offboardings produces override admissions that finalize without any ack — the worst case for an audit-grade certificate.",
+          "breaking": true,
+          "solution": "Explicit retry-and-timeout policy on drain-ack delivery: tenant_store retries a missing ack with documented exponential backoff up to a per-tenant retry budget bounded by the HLC offboarding window. On retry-budget exhaustion the certificate-of-deletion finalizes in one of two documented modes: (a) STRICT — refuse-attestation: the offboarding fails, lifecycle_gate emits a typed 'erasure-incomplete' event to compliance_audit naming the missing writer and the operator must drive remediation before any new attempt; OR (b) PARTIAL-WITH-WITNESSES — the certificate finalizes WITH explicit witness records (a witness is the broadcast-emit attestation from lifecycle_gate plus an in-region observer ack from another writer that observed the missing writer was reachable at broadcast-emit time but did not ack within the window) and is typed as a partial-with-witnesses certificate, machine-distinguishable from a full-ack certificate. Selection between STRICT and PARTIAL-WITH-WITNESSES is per-jurisdiction policy carried on the residency policy itself, not a per-incident operator decision. Best-effort-without-witnesses is not a permitted finalization mode.",
+          "derived_reqs": [
+            "r-s5-composite-cert-retry-policy",
+            "r-s5-composite-cert-assembly"
+          ],
+          "affects": [
+            "region_coordinator",
+            "tenant_store",
+            "gateway",
+            "fanout",
+            "address_index",
+            "chain_router",
+            "usage_meter",
+            "compliance_audit"
+          ]
+        },
+        {
+          "id": "s5-audit-key-destruction-race",
+          "description": "audit_encryption_key_register destroys the per-tenant audit-encryption key for tenant T at HLC t_destroy. A writer's clock is behind: its audit-write is encrypted at t_destroy - epsilon under the still-current key, but is delivered to compliance_audit at t_destroy + delta, after lifecycle_gate has issued the DESTROYED event. Without an at-root contract, compliance_audit may either reject the late write (audit gap, contradicts the drain-ack the writer already gave) or admit it under the prior key generation (destruction is not actually atomic; the cryptographic shred is fuzzy). The four-phase destruction assumes drain-acks bound this; this stressor verifies the assumption against the writer-side HLC-skew degraded mode in v8.",
+          "attractor": "If destruction relies solely on drain-ack to bound in-flight writes, but the writer ack-then-dies-with-residual under S3's handoff path, the residual writes can land at compliance_audit after t_destroy under a destroyed key — the entry skeleton hash-chains correctly but ciphertext is unreadable from inception (which is the goal for crypto-shred BUT not for an in-flight write that the writer believed was successful at t_destroy - epsilon). Operator confidence in 'audit-write delivered before drain-ack' is misplaced under HLC-skew-degraded mode where the writer's HLC may be behind the destroyer's HLC. Without a clock-skew-bounded fence, destruction may proceed before the writer's local clock catches up to the broadcast HLC.",
+          "breaking": true,
+          "solution": "Two-phase fence holds the assumption: (PHASE A) drain-fence broadcast for tenant T includes a fence-HLC f_T; every writer must ack drain-of-in-flight-audit-writes-for-T at HLC >= f_T + skew_bound, where skew_bound is region_coordinator's hybrid_clock degraded-mode bound; the writer's local HLC at ack must be >= f_T + skew_bound which means the writer is monotonically past the destruction-HLC. (PHASE B) lifecycle_gate's audit-key DESTROYED event for T is only issued at HLC t_destroy >= max(observed_ack_hlc, f_T + skew_bound) + write-delivery-grace, where write-delivery-grace bounds compliance_audit's inbound-queue residence time. Late writes arriving at compliance_audit at t_destroy + delta are detected at the inbound-queue admission check: their (writer_id, encrypted-at-HLC) must be <= the writer's drain-ack-HLC for T, otherwise they are rejected as protocol-violating (ack-after-write contract violated by the writer) and surfaced to compliance_audit's protocol-violation log. The cryptographic shred is sharp: every entry whose key still exists at compliance_audit ingest time is decryptable; every entry arriving after key-destruction is rejected, not silently shred.",
+          "derived_reqs": [
+            "r-s5-audit-key-destruction-fence",
+            "r-s5-compliance-audit-late-write-rejection"
+          ],
+          "affects": [
+            "region_coordinator",
+            "tenant_store",
+            "compliance_audit",
+            "gateway",
+            "fanout",
+            "address_index",
+            "chain_router",
+            "usage_meter"
+          ]
+        },
+        {
+          "id": "s5-policy-2pc-stuck-prepared",
+          "description": "tenant_store has acked quarantine-and-relocate-complete to region_coordinator's residency_publisher (the 'prepared' phase of the 2PC bubble-tenant_store-3 introduces) but the activation broadcast (the 'commit' phase) is lost. tenant_store is in V+1-prepared state: residency-pinned writes are quarantined-and-relocated under V+1, but consumers (edge, gateway, usage_meter, metrics_store) still serve under V because they never observed the activation. Writes admitted under V are now landing in tenant_store under a layout that V's residency rules forbid; reads under V miss data that has been relocated. Without an explicit recovery contract, this state can persist indefinitely.",
+          "attractor": "Stuck-prepared persists silently: tenant_store has relocated data and cannot un-quarantine (V+1 layout is partially live), but no consumer observes activation; the system runs in a half-state where residency policy V is enforced at consumers and V+1 is enforced at storage. Operator pressure to 'just activate V+1' from tenant_store-side observation creates a different split-brain — consumers ack V+1 out-of-order (some after the operator-forced activation, others not) and residency_publisher's activation CAS no longer reflects observed reality. The longer the stuck-prepared state lasts, the harder rollback is (relocated data has accumulated).",
+          "breaking": true,
+          "solution": "residency_publisher's V+1 activation is itself a 2PC at root: PREPARE phase requires the quarantine-and-relocate-complete ack from tenant_store before the M-of-regions quorum-witnessed activation CAS proceeds; COMMIT phase activates V+1 region-wide via the existing push-and-acknowledge channel. tenant_store's prepared state has an HLC-bounded prepared-window: if no commit-or-abort decision has been observed within the window, tenant_store enters a 'prepared-orphan' degraded mode in which it ALARMS region_coordinator's lifecycle_gate (named recovery state, not silent rollback) and refuses further V+1 prepares until lifecycle_gate explicitly resolves to commit (re-broadcast activation under M-of-N operator-credential authorization since the situation indicates control-plane disagreement) or abort (rollback the relocate, see S8). Recovery is operator-driven under M-of-N but not silent: the prepared-orphan state writes a typed entry to compliance_audit and is visible on operator dashboards. Consumers under V remain at V until they observe a strictly newer activation from residency_publisher, never accepting an out-of-band 'activation' from tenant_store.",
+          "derived_reqs": [
+            "r-s5-residency-2pc-prepare-fence",
+            "r-s5-residency-2pc-prepared-orphan",
+            "r-s5-consumer-activation-source"
+          ],
+          "affects": [
+            "region_coordinator",
+            "tenant_store",
+            "edge",
+            "gateway",
+            "usage_meter",
+            "metrics_store"
+          ]
+        },
+        {
+          "id": "s5-policy-2pc-abort-rollback",
+          "description": "region_coordinator decides to abort a pending V+1 activation after some regions have already received the prepare and tenant_store has begun quarantine-and-relocate. Rolling back the relocate is non-trivial: relocated data must move back to its V-permitted partition; in-flight writes that landed under V+1-prepared must be re-classified; idempotency of relocate-and-rollback is implicit in v8. Concurrent aborts (operator changes mind twice) compound the problem.",
+          "attractor": "Without explicit idempotency on rollback, repeated aborts (operator retries during a flapping decision) may double-rollback (relocate data forward then back then forward again), corrupting per-key residency state. Without a documented abort-window, in-flight V+1-prepared writes that arrive AFTER the abort decision but BEFORE all consumers observe it land under a now-aborted layout that no consumer will ever consult. The abort decision is a control-plane event that must converge with the same M-of-regions guarantees as activation.",
+          "breaking": true,
+          "solution": "Abort is itself an M-of-regions quorum-witnessed CAS event with monotonic abort_id per (V+1) attempt; the abort decision invalidates the (V+1, attempt_id) tuple but leaves V active. tenant_store's relocate-and-rollback is idempotent on (tenant_key, V+1, attempt_id): receiving the same abort_id twice is a no-op; receiving a strictly newer attempt_id (operator retries V+1 prepare) starts a fresh relocate from V's current state, never from a half-rolled-back state. In-flight writes that arrived under V+1-prepared but never observed commit are quarantined to a typed 'prepared-orphan-write' state on tenant_store and surfaced for operator review (likely re-played under V on rollback complete, but only under explicit decision rather than silent re-classification). Each abort writes a typed entry to compliance_audit.",
+          "derived_reqs": [
+            "r-s5-residency-2pc-abort-idempotency"
+          ],
+          "affects": [
+            "region_coordinator",
+            "tenant_store"
+          ]
+        },
+        {
+          "id": "s5-roster-rotation-cross-component-ordering",
+          "description": "A roster_version bump arrives at chain_router before tip_quorum (or vice versa). An in-flight M-of-N override proposal carries a credential that is valid under v_old but not v_new (compromised credential, scheduled rotation removal, etc.). Without a uniform cross-component invalidation ordering rule, the same proposal commits in chain_router (still on v_old) and is rejected in tip_quorum sub-zoom (already on v_new), leaving the system in an asymmetric override state — particularly bad when drain_coordinator force-complete consumes a chain_router-admitted override that tip_quorum would have rejected.",
+          "attractor": "Without uniform invalidation ordering, the system is pushed toward override-state asymmetry: an attacker holding a credential being rotated out can race the rotation broadcast to commit a proposal in the laggard component while the leading component already rejects it. drain_coordinator force-complete is the worst case because the chain_router-side override may have already produced a state mutation that tip_quorum-side rejects ratifying, leaving the system mid-mutation under no valid override. Operator confidence in 'rotation invalidates immediately' is misplaced.",
+          "breaking": true,
+          "solution": "Cross-component uniform invalidation contract on roster_version: every override-admission consumer (chain_router pool_membership_manager, tip_quorum sub-zoom, drain_coordinator sub-zoom, lifecycle_gate sub-zoom) treats roster_version monotonically AND the contract requires that an override proposal only commits if EVERY component it touches has an effective roster_version >= the proposal's signing roster_version at the same moment in HLC time. region_coordinator's credential_roster publishes rotation-prepare BEFORE rotation-activate (analogous to residency_publisher's 2PC): rotation-prepare collects ack from every override-admission consumer; rotation-activate is M-of-regions quorum-witnessed and consumers commit to v_new only on observing activation. In-flight proposals at the moment of activation are cancelled at every consumer (cancel-by-roster-version) atomically with the activation broadcast — a proposal whose signing roster_version < v_new is rejected at every consumer, even consumers that haven't yet processed the activation locally because they enforce the rule by consulting region_coordinator's currently-active roster_version on every commit. Per-component cancel-and-rollback semantics for in-flight proposals (already covered at zoom scope by r-s4-roster-revocation-propagation) compose with this at-root ordering rule.",
+          "derived_reqs": [
+            "r-s5-roster-rotation-uniform-ordering"
+          ],
+          "affects": [
+            "region_coordinator",
+            "chain_router"
+          ]
+        },
+        {
+          "id": "s5-offboarding-idempotent-apply",
+          "description": "A consumer (gateway, fanout, address_index, usage_meter, chain_router) restarts mid-apply of a lifecycle_gate-signed offboarding signal for tenant T. On replay, the per-tenant terminal-state must be reached at-most-once: drain-acks already issued cannot be retracted-and-re-issued, accounting records cannot be double-finalized, watch tombstones cannot be double-tombstoned (which would re-broadcast and tickle other consumers' dedupe by a stale (offboarding_id, component_id, attempt_id)). Without an explicit at-root idempotent-apply contract, double-apply could re-issue a drain-ack the consumer already retracted (breaking bubble-2's drain-fence contract from S3) or finalize counters twice.",
+          "attractor": "Existing dedupe (r-s4-offboarding-signal-auth, bubble-region_coordinator-4) keys on (offboarding_id, component_id, attempt_id) but only ensures the consumer doesn't APPLY twice. It does not constrain the apply to be commutative-and-idempotent on terminal-state side-effects: a partial apply that wrote a watch-tombstone but not a drain-ack, on restart, could re-tombstone (a no-op locally but generates a duplicate compliance_audit entry) and then issue the drain-ack as if from a fresh apply. The result is two compliance_audit entries (typed offboarding-attestation) for the same (offboarding_id, component_id) which the certificate-of-deletion assembly cannot reconcile.",
+          "breaking": true,
+          "solution": "Per-component idempotent-apply contract for HLC+nonce-keyed offboarding signals: every offboarding consumer maintains a durable per-(offboarding_id, component_id) apply-state record with a small set of typed phase-markers — RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL — that are written durably before each phase advance. On restart, the consumer reads the apply-state record and resumes from the last durable phase, never re-running an earlier phase whose side-effects are non-idempotent (e.g. compliance_audit attestation write is gated on ATTESTATION-WRITTEN being absent). The consumer NEVER retracts a drain-ack once emitted (no compensating action that creates a 'sometimes-ack-sometimes-not' state observable by tenant_store). compliance_audit's offboarding-attestation entries are keyed on (offboarding_id, component_id) for de-duplicating on the read side as a last-resort defense; consumers' ATTESTATION-WRITTEN phase-marker prevents the duplicate from being written in the first place.",
+          "derived_reqs": [
+            "r-s5-offboarding-idempotent-apply"
+          ],
+          "affects": [
+            "region_coordinator",
+            "gateway",
+            "fanout",
+            "address_index",
+            "chain_router",
+            "usage_meter",
+            "compliance_audit"
+          ]
+        },
+        {
+          "id": "s5-policy-ack-prewarm-cold-start",
+          "description": "A consumer (gateway, edge, usage_meter, metrics_store) cold-starts (or fails over to a fresh instance) into the middle of a residency policy_version transition. v8's sticky-deny-by-default + monotonic-per-(consumer, version) (r-s4-policy-ack-monotonic) means a fresh instance with no warmed ack history must deny everything for the publisher's freshness window. Worst case: a cold-start at the start of a tightening transition denies all traffic until the next ack window opens, which can be minutes — and during a region failover or scale-out event, MANY instances cold-start at once.",
+          "attractor": "Without a pre-warm protocol, scale-out and failover events become correlated deny-storms: every cold-starting instance independently waits for residency_publisher's next ack window before serving residency-pinned traffic. Operator pressure under deny-storm is to disable the sticky-deny-by-default contract, which collapses the residency safety property. Alternatively, operators may pre-emptively ack-all-versions on behalf of the cold-start instance, which violates the per-(consumer, version) monotonic-ack contract (instance hasn't actually verified policy V) and creates ghost acks that persist past the fresh instance's actual readiness.",
+          "breaking": true,
+          "solution": "Per-consumer pre-warm contract on cold-start: a fresh consumer instance, on registration with residency_publisher, requests a 'pre-warm hydration' that delivers the currently-active policy_version's full state synchronously; the consumer ack-readies the currently-active version inline as part of registration (not waiting for the next push window) and only AFTER ack-readying the active version does it begin serving residency-pinned traffic. The pre-warm hydration is treated by residency_publisher as an in-band ack from a fresh consumer instance and is rate-limited per-region to bound publisher load under correlated cold-start (scale-out) events. Pre-warm is a separate channel from steady-state push-and-acknowledge and does not bypass the monotonic-per-(consumer, version) contract: the hydration carries the active version and the consumer's instance_id (each instance has a distinct ack history). The pre-warm freshness budget is documented; if pre-warm cannot complete within budget the consumer falls to deny-by-default for residency-pinned operations and reports a 'pre-warm-stalled' state to operators.",
+          "derived_reqs": [
+            "r-s5-policy-ack-prewarm"
+          ],
+          "affects": [
+            "region_coordinator",
+            "gateway",
+            "edge",
+            "usage_meter",
+            "metrics_store"
+          ]
+        },
+        {
+          "id": "s5-cert-verification-post-destroy",
+          "description": "A subpoena arrives months or years after the audit key for tenant T was destroyed. The certificate of deletion is itself verifiable (hash-chain intact, drain-acks present, DESTROYED log entry present) — but the per-store erasure attestations and per-tenant audit entries that the certificate VOUCHES FOR are encrypted under T's audit key and no longer decryptable by design. The compliance question: is the certificate-of-deletion sufficient as STANDALONE proof for the regulator/court, or does compliance_audit need to retain decryptable witness records on a SEPARATE key class (organizational key, not per-tenant) so that the structure-and-presence of the attested events remains inspectable post-shred?",
+          "attractor": "If the certificate is the only artifact and per-tenant entries are unreadable, regulators may treat the certificate as a strong-but-opaque claim that cannot be independently inspected — pushing toward 'show me the records' demands that the system literally cannot satisfy. Conversely, if EVERY attested event is mirrored under a separate non-shred-able key, crypto-shred no longer guarantees tenant erasure (the entries' tenant-identifying fields are still readable on the witness key), defeating the purpose. The attractor is a blurred shred boundary.",
+          "breaking": true,
+          "solution": "Two-tier audit material: (TIER 1, per-tenant key, shredded on erasure) — the full audit entry payload including tenant-identifying fields, request payload digests, signing-credential identities, and any other tenant-attributable detail; (TIER 2, organizational long-lived key, NOT shredded) — a structural witness of each attested event: event type (e.g. 'erasure-attestation', 'drain-ack', 'override-admission'), event HLC, originating component, and a hash commitment to the (now-shredded) Tier-1 payload. The certificate-of-deletion vouches for Tier-2 witnesses by verifiable hash chain; a regulator inspecting post-shred sees the structure-and-presence of every attested event in correct sequence, can verify the hash chain is intact, and can verify that each Tier-2 hash commitment matches what Tier-1 SAID was there (without seeing the tenant-identifying contents). Tier-2 contains NO tenant-identifying material so is not subject to erasure. The two-tier scheme is named at root; the per-tenant audit-encryption-key lifecycle remains a tenant_store zoom concern; the organizational long-lived key is part of the OOB-anchor key hierarchy under region_coordinator.",
+          "derived_reqs": [
+            "r-s5-audit-tier-witness"
+          ],
+          "affects": [
+            "region_coordinator",
+            "tenant_store",
+            "compliance_audit"
+          ]
+        },
+        {
+          "id": "s5-drain-fence-roster-rotation-interleave",
+          "description": "S3's drain-fence broadcasts are signed by lifecycle_gate; lifecycle_gate-signing credentials are roster-bound and may rotate mid-broadcast. If a broadcast began under v_old roster and the writer's ack arrives under v_new (because S9's rotation activated cross-component during the broadcast), are the acks still verifiable? If acks must be re-signed under v_new, has the drain window expanded past its HLC bound? Worst case interleave: a roster rotation activated to revoke a compromised signing credential lands during a bulk-offboarding storm; if revoked-credential-signed broadcasts retroactively become invalid, all in-flight drain-fences are unverifiable and writers cannot ack.",
+          "attractor": "Without an interleave rule, the system is pushed toward one of three failure modes: (a) revoked-credential-signed broadcasts remain valid for in-flight drain-fences (the revocation is delayed for in-flight ops, breaking the 'compromise-revocation invalidates immediately' contract from credential_roster); (b) revoked-credential-signed broadcasts become invalid retroactively, all in-flight drain-fences are unverifiable, writers cannot ack, the offboarding HLC window expires under S5's retry budget, certificates of deletion finalize as erasure-incomplete or partial-with-witnesses; (c) re-sign in flight, but the re-signed broadcast has a different broadcast-emit-HLC and the per-tenant ack window calculation gets confused, S4's bounded-batching invariants are violated. None of these is acceptable.",
+          "breaking": true,
+          "solution": "lifecycle_gate's drain-fence broadcasts are signed under a roster_version that is recorded in the broadcast itself; writers verify the signature against the broadcast's named roster_version, NOT against the writer's currently-cached roster_version. The signed broadcast is a self-contained credential bundle: writers may verify it for the duration of its HLC-bounded ack window even after a roster rotation has activated v_new, PROVIDED the signing credential at broadcast-emit-HLC was not subsequently revoked by COMPROMISE (scheduled rotation removal is not retroactively invalidating; compromise-revocation is). credential_roster's compromise-revocation event carries a 'retroactive-as-of-HLC' field — usually equal to the revocation HLC (no retroactive effect) but may be set to an earlier HLC when forensics establish compromise predates discovery; in that case in-flight broadcasts whose emit-HLC is at or after the retroactive-as-of-HLC become invalid and lifecycle_gate MUST re-sign-and-rebroadcast within S4's bounded-batching framework with a fresh broadcast-emit-HLC and a fresh per-tenant ack window. Every retroactive compromise-revocation is M-of-N-authorized at the elevated-issuance threshold and writes a typed entry to compliance_audit identifying the affected broadcasts.",
+          "derived_reqs": [
+            "r-s5-broadcast-self-contained-credential"
+          ],
+          "affects": [
+            "region_coordinator",
+            "gateway",
+            "fanout",
+            "address_index",
+            "chain_router",
+            "usage_meter",
+            "tenant_store"
+          ]
+        }
+      ]
+    }
+  ],
+  "active_session": null,
+  "schema_version": 2,
+  "needs_affects_backfill": []
+}

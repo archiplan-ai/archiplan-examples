@@ -1,0 +1,175 @@
+{
+  "problem": "Internal architecture of 'gateway' (type: Service — A deployable runtime component that handles requests, performs work, or coordinates other components). Node: Stateless authenticated request entry: validates API keys and residency policy against auth_cache (with tenant_store as the canonical source on miss), enforces per-key rate limits via auth_cache and global throttle flags pushed by region_coordinator, records usage with usage_meter, routes RPC requests to chain_router and websocket subscriptions to fanout. Time-bucketed enforcement uses the hybrid logical clock from region_coordinator rather than wall-clock; observed inter-region clock skew above a threshold transitions the region into a documented degraded mode. Deployed in every region; no per-connection state outside auth_cache and fanout. Connections: gateway --reads_from-> tenant_store; edge --calls-> gateway; gateway --calls-> chain_router; gateway --calls-> fanout; gateway --calls-> usage_meter; gateway --reads_from-> auth_cache; gateway --writes_to-> auth_cache; gateway --calls-> region_coordinator. Parent requirements: R-historical: Clients can query state at any historical block on every supported chain (archive semantics, not just recent state); R-realtime-newheads: Clients can subscribe over WebSocket and receive every new block header as it is observed by the corresponding chain node; R-realtime-mempool: Clients can subscribe over WebSocket and receive pending/unconfirmed transactions, including Cardano via the Ogmios local-tx-monitor mini-protocol; R-realtime-address: Clients can subscribe over WebSocket to a watched address and receive an event whenever that address sends or receives value on the corresponding chain; R-multitenant: Every request and subscription is authenticated to a specific tenant via an API key looked up in the tenant store; R-ratelimit: Per-API-key request-rate limits and usage quotas are enforced before the request reaches a chain node; R-passthrough: Each chain's native JSON-RPC / mini-protocol surface is exposed to clients without translation to a unified cross-chain schema; R-reorg-safe: The system delivers reorg-safe semantics: WebSocket subscribers receive explicit rollback notifications, and REST/RPC responses can express finality status; R-chain-redundancy: For every supported chain, the system maintains multiple healthy chain-node replicas; failure of any single replica does not cause a client-visible error or subscription drop; R-chain-health: Every chain-node replica is continuously health-checked; unhealthy replicas are excluded from the routing pool until they recover; R-finality-model: Every chain has an explicit finality model and every emitted event carries the chain's confirmation depth and finality status at emission time; R-reorg-replay: When a reorg occurs at any depth, subscribers receive an explicit rollback notification identifying the divergence point and a replay of the new canonical events; R-confirmation-threshold: Subscribers can configure a per-stream confirmation threshold; events below the threshold are not delivered as confirmed; R-fanout-scale: System supports at least 1M concurrent websocket subscribers per chain stream without per-process bottlenecks; R-fanout-decoupled: Subscription fanout is decoupled from request handling; new subscribers do not degrade RPC request latency; R-event-index: System maintains a per-chain index of block events keyed by address so address-subscription matching scales sub-linearly in the number of subscribers; R-query-cost: System enforces a per-request and per-tenant cost budget on chain queries; over-budget requests are rejected with guidance to chunk or use the historical pool; R-historical-isolation: Long-running historical queries do not contend with tip-state requests on the same chain-node replica; R-auth-cache: Gateway caches tenant credentials and rate-limit state with explicit TTLs so a transient tenant_store outage does not cause a service outage; R-degradation: When tenant_store is unreachable, gateway operates in a documented degraded mode (cache-served auth, queued counter updates) and surfaces the degradation in metrics; R-key-rotation: Tenants can rotate API keys without service interruption (multiple active keys per tenant, immediate revocation, hot replacement); R-key-anomaly: System detects anomalous API-key usage (geo, IP, request-pattern shifts) and alerts the tenant; R-pending-state-machine: Pending-transaction events are emitted as transitions in a documented per-chain state machine (seen, replaced-by, dropped, confirmed) so subscribers can reason about non-monotonic mempool changes; R-subscription-cursor: Every event on a subscription stream carries an opaque cursor; clients can reconnect and request 'resume from cursor X' to replay missed events within a documented retention window; R-edge-protection: Untrusted public traffic is filtered at an edge layer (TLS termination, IP rate-limit, WAF, bot mitigation) before it reaches the gateway's chain-bound code paths; R-chain-upgrade: Every supported chain has a documented upgrade procedure that pre-stages new node/bridge versions and transitions traffic across forks without a client-visible outage; R-protocol-version: Every subscription and response surface advertises a protocol/schema version so client code can detect and negotiate compatible behaviour across chain upgrades; R-multi-region: System runs active-active in at least two independent regions; failure of any one region does not cause a global outage and clients reconnect into a surviving region without manual intervention; R-cost-accounting: System measures per-tenant cost drivers beyond request count (chain-node CPU, response bytes / egress) and attributes them to the tenant in near-real-time; R-plan-ceilings: Each tenant plan has explicit monthly cost ceilings; approaching the ceiling triggers warnings, crossing it triggers throttle/reject with a clear error; R-tenant-metrics: Tenants can read per-key usage, error, latency, and rate-limit-headroom metrics for at least the past 30 days through a metrics API; R-chain-cross-check: System cross-checks chain head and canonical block hashes across multiple chain-node replicas and quarantines any replica that diverges from the consensus tip; R-client-diversity: Where a chain has multiple production-quality client implementations, the chain-node pool includes more than one implementation to bound client-bug blast radius; R-tiered-storage: Per chain, the system supports tiered storage (hot recent state, cold deep archive with on-demand re-warming) so storage cost grows sub-linearly with chain history; R-pruned-replicas: For tip-state requests, the chain pool can include pruned (non-archive) replicas; tip-state read capacity scales independently of archive storage; R-bounded-clock-skew: Rate-limit windows and other time-bucketed enforcement use a hybrid-logical or coordinated clock that bounds inter-region skew explicitly; observed skew above a threshold puts the affected region into a documented degraded mode",
+  "current_version": 1,
+  "versions": [
+    {
+      "id": 0,
+      "note": "v0: Naive gateway sub-architecture — listener dispatches to request_path/subscription_path/metrics_api Subroles, all Subroles use the auth_check Sidecar; external boundaries (edge_filter, auth_cache, tenant_store, chain_router, fanout, usage_meter, metrics_store, region_coordinator) modelled as External nodes; 22 inherited initial requirements satisfied; CRITICAL K̄=1.38 P̄=0.65",
+      "from_session": null,
+      "created_at": "2026-05-01T18:42:39.812252+00:00"
+    },
+    {
+      "id": 1,
+      "note": "v1: stressed gateway sub-architecture — Subroles and auth_check redefined with bounded backpressure, hot/cold auth split, throttle re-check, RPC cost-class pool partition, metrics query-cost budget, fanout-liveness watchdog and stream-suspended control event, rejection accounting; listener redefined with admission control, jittered-backoff hints, last-known-good warm start, sole in-process HLC source, region-level health surface; HLC fan-out edges from Subroles/auth_check to region_coordinator collapsed onto listener; auth_check -> usage_meter edge added; 14 derived reqs satisfied (from stress session 1)",
+      "from_session": 1,
+      "created_at": "2026-05-01T18:47:47.863633+00:00"
+    }
+  ],
+  "stress_sessions": [
+    {
+      "id": 1,
+      "against_version": 0,
+      "produced_version": 1,
+      "stressors": [
+        {
+          "id": "S-sub-slow-consumer",
+          "description": "A subset of websocket subscribers consume the event stream slowly (mobile, NAT, congested links). subscription_path forwards every fanout event to the client connection, but there is no documented backpressure between the fanout downstream and the slow client socket — the kernel send buffer grows, then subscription_path's user-space buffer grows, until the process runs out of memory or the OS kills it. The naive design relies on TCP backpressure alone, which only takes effect once the kernel buffer is full",
+          "attractor": "subscription_path memory grows monotonically with the number of slow subscribers; eventually OOMs and takes every healthy subscription on that process down with it. The system attractor is 'one bad subscriber kills the process'",
+          "breaking": true,
+          "solution": "subscription_path defines an explicit per-subscription egress queue with a bounded length and a documented overflow policy: when the queue exceeds the threshold, subscription_path emits a 'slow-consumer' control event to the client, asks fanout to advance the cursor (skipping with a gap-marker) or unsubscribes the slow client. fanout's subscribe API is extended with a per-subscription consumer-rate signal that subscription_path reports back",
+          "derived_reqs": [
+            "R-gw-sub-backpressure"
+          ],
+          "affects": [
+            "subscription_path"
+          ]
+        },
+        {
+          "id": "S-reconnect-storm-local",
+          "description": "Mass reconnect into this region after an upstream flap (anycast convergence, edge restart, peer region drain) — 200k subscribers and 50k API clients reconnect inside a few seconds. listener accepts each, dispatches to the right Subrole, every Subrole calls auth_check synchronously; auth_check pages auth_cache (cold for many keys), each miss falls back to tenant_store; meanwhile subscription_path registers each connection with fanout. The naive design has no admission control between listener and auth_check, no bulk-hydrate path for auth_cache misses, and no jittered backoff hint to clients",
+          "attractor": "auth_check queue grows; tenant_store throughput cap is hit; fanout's subscribe RPC saturates; new connections time out at listener, prompting client retries that compound the load. Latency on healthy tenants spikes globally inside the affected region for minutes after the original flap",
+          "breaking": true,
+          "solution": "listener implements admission control with a region-wide concurrent-handshake budget and emits jittered-backoff hints to clients past the threshold; auth_check exposes a bulk-hydrate batch path that listener uses to pre-warm auth_cache for the API keys observed in the handshake batch; subscription_path coalesces fanout subscribe calls into batches per-chain. The reconnect-storm-control behaviour bubbles up to gateway as a whole, not just listener",
+          "derived_reqs": [
+            "R-gw-listener-admission",
+            "R-gw-auth-bulk-hydrate",
+            "R-gw-fanout-subscribe-batch"
+          ],
+          "affects": [
+            "listener",
+            "auth_check",
+            "subscription_path",
+            "request_path"
+          ]
+        },
+        {
+          "id": "S-fanout-outage",
+          "description": "fanout becomes unreachable from this region (network partition, fanout-bus failure, region-coordinator declaring fanout unhealthy). subscription_path is mid-stream for thousands of subscribers; new subscribe calls hang. The naive design has no failure semantic on the subscription_path -> fanout call: connections stay open with no events, clients have no signal that the stream is dead, and reconnects target the same broken region",
+          "attractor": "Subscribers see a silent stream — no events, no rollback, no end-of-stream — and don't reconnect. When fanout recovers, subscribers' cursors are far behind the ring-buffer retention window, causing missed events. Operationally, the system looks healthy on the gateway side while subscribers are blind",
+          "breaking": true,
+          "solution": "subscription_path implements an explicit fanout-liveness watchdog: on extended unreachability or repeated subscribe failures it emits a documented 'stream-suspended' control event to subscribers (with reconnect guidance and the last-known cursor) and either holds with periodic re-probe (configurable) or actively closes the websocket so clients reconnect. listener exposes the fanout-suspended state to edge-level health so anycast can shift traffic",
+          "derived_reqs": [
+            "R-gw-fanout-liveness",
+            "R-gw-region-health-signal"
+          ],
+          "affects": [
+            "subscription_path"
+          ]
+        },
+        {
+          "id": "S-metrics-scan-abuse",
+          "description": "A tenant (or compromised key) hammers metrics_api: 30-day windows at 1s interval, all keys, all metrics. metrics_api authenticates and reads metrics_store unbounded — the naive design enforces only auth_check's per-key rate limit, which is sized for typical RPC traffic, not for high-cardinality metrics_store scans. metrics_store backend latency degrades, affecting other tenants reading metrics, and the noisy tenant's own RPC traffic latency degrades because metrics_store contention is not isolated",
+          "attractor": "metrics_store p99 climbs; metrics_api throughput collapses; legitimate tenants see slow metrics; usage_meter (which writes metrics_store) suffers write delays — feedback loop where the noisy tenant's signals get under-recorded",
+          "breaking": true,
+          "solution": "metrics_api enforces a per-tenant query-cost budget specifically for metrics queries (separate from RPC rate-limit), modelled after chain_router's cost budget: requests above the budget are rejected with chunking guidance. Heavy metrics queries route to a dedicated metrics_store read path (read replicas or async result job) so they don't contend with usage_meter writes",
+          "derived_reqs": [
+            "R-gw-metrics-query-budget",
+            "R-gw-metrics-isolation"
+          ],
+          "affects": [
+            "metrics_api"
+          ]
+        },
+        {
+          "id": "S-auth-check-bottleneck",
+          "description": "auth_check is invoked synchronously by every Subrole on every request and subscription. Under sustained high RPS (200k req/s region-wide) the synchronous auth_check call becomes a head-of-line queue: a slow tenant_store fallback during a single key's TTL expiry stalls request_path, subscription_path, and metrics_api alike, even for tenants whose keys are warm in auth_cache. The naive design serialises hot-path auth and cold-path tenant_store hydration on the same call",
+          "attractor": "Latency spikes correlate with rare tenant_store fallbacks regardless of which tenant is calling; head-of-line blocking masquerades as 'auth_check is slow'; horizontal scaling of Subroles doesn't help because auth_check is per-process and contended on its tenant_store call",
+          "breaking": true,
+          "solution": "auth_check splits the hot path (auth_cache lookup) from the cold path (tenant_store hydration on miss): hot path returns synchronously and is non-blocking; misses queue an asynchronous hydration request and return a documented 'cache-miss' decision. Subroles either reject with 'try again' or, for high-confidence keys, accept on a documented optimistic path with eventual reconciliation. The decision is made in auth_check, not the Subrole",
+          "derived_reqs": [
+            "R-gw-auth-hot-cold-split"
+          ],
+          "affects": [
+            "auth_check",
+            "request_path",
+            "subscription_path",
+            "metrics_api"
+          ]
+        },
+        {
+          "id": "S-throttle-flag-race",
+          "description": "A tenant exhausts a global plan ceiling. region_coordinator pushes a throttle flag into auth_cache. But there are N in-flight requests already past auth_check across listener/request_path/subscription_path that don't re-check the flag — they reach chain_router, fanout, usage_meter, and complete normally. The naive design has a one-shot auth_check at the entry of each Subrole; long-running RPCs (heavy historical queries) and long-lived websocket subscriptions never re-check the flag",
+          "attractor": "Tenants over-shoot ceilings by the depth of in-flight work; for websockets, a flagged tenant continues to receive events for the lifetime of the existing subscription. Plan-ceiling enforcement is technically present but bypassed in practice for the high-cost cases",
+          "breaking": true,
+          "solution": "auth_check exposes a re-check path: subscription_path re-evaluates the throttle flag periodically while a subscription is active and tears the subscription down with a documented control event when flagged; request_path re-evaluates before yielding response chunks for streaming/large RPCs. The throttle-flag in auth_cache carries a version, and Subroles cache the version they accepted with so re-checks are cheap",
+          "derived_reqs": [
+            "R-gw-throttle-recheck"
+          ],
+          "affects": [
+            "auth_check",
+            "request_path",
+            "subscription_path"
+          ]
+        },
+        {
+          "id": "S-listener-cold-start",
+          "description": "A region cold-starts a new gateway instance (autoscale event, deploy). listener calls region_coordinator on startup to learn protocol version, residency-policy hints, and HLC seed. region_coordinator is partition-isolated or experiencing high latency. The naive design has no cached/last-known config: listener cannot advertise protocol version, so it cannot accept any traffic until region_coordinator returns. Autoscale capacity comes online slow during the worst time (a load spike that triggered the autoscale)",
+          "attractor": "New listener instances stall in a 'starting' state for tens of seconds; available region capacity grows slower than the load that's hitting it; the autoscale loop misfires (more replicas spun up while existing ones stall on the same dependency)",
+          "breaking": true,
+          "solution": "listener persists last-known protocol-version, residency hints, and HLC seed to a local read cache (durable across process restarts) and starts in a documented 'last-known-good' mode if region_coordinator is unreachable, refreshing in the background. listener's degraded-mode metric makes the state visible to operators",
+          "derived_reqs": [
+            "R-gw-listener-warm-start"
+          ],
+          "affects": [
+            "listener"
+          ]
+        },
+        {
+          "id": "S-hlc-subrole-skew",
+          "description": "Each Subrole and the auth_check Sidecar independently fetches the hybrid logical clock from region_coordinator (per call or per refresh interval). When region_coordinator load is high, refresh cadences drift across components in the same gateway process; auth_check uses HLC bucket B for its rate-limit counter, while subscription_path's throttle re-check (R-gw-throttle-recheck) uses HLC bucket B+1. Within one gateway, the same tenant is rate-limited inconsistently across paths",
+          "attractor": "Rate-limit windows produce non-deterministic accept/reject decisions for borderline tenants depending on which Subrole fielded the request; debugging is painful because the same tenant succeeds and fails on otherwise identical paths",
+          "breaking": true,
+          "solution": "listener owns the in-process HLC source and exposes a single in-memory snapshot to every Subrole and Sidecar via a process-local accessor. listener refreshes from region_coordinator on a documented cadence (and on skew threshold transitions); Subroles never call region_coordinator for HLC directly. This collapses the per-process HLC fan-out edges from many to one",
+          "derived_reqs": [
+            "R-gw-hlc-single-source"
+          ],
+          "affects": [
+            "auth_check",
+            "request_path",
+            "subscription_path",
+            "listener"
+          ]
+        },
+        {
+          "id": "S-rpc-long-tail",
+          "description": "request_path holds an RPC connection open until chain_router returns the response. Heavy historical RPC (eth_getLogs across millions of blocks, ada-Ogmios full UTXO traversal) takes 60-120s. Even with chain_router enforcing query-cost budgets, requests under the budget can still take a long time. With many concurrent long-tail RPCs, request_path's per-process slot count saturates and shorter requests behind them queue or are rejected by the listener admission control (R-gw-listener-admission), creating a self-induced latency cliff",
+          "attractor": "p99 latency on cheap RPCs degrades because of head-of-line blocking by long-tail requests; under listener admission control, normal traffic gets jittered-backoff hints while long-tail requests continue to occupy slots",
+          "breaking": true,
+          "solution": "request_path partitions its in-flight slot pool into a 'short-RPC' pool and a 'long-RPC' pool by chain_router's per-method cost class signal (returned at request submission); long-tail requests cannot starve short ones. listener forwards the cost-class hint via the dispatch envelope so request_path can place the slot at admission time. Backpressure on the long pool surfaces a 'try chunking' error rather than blocking",
+          "derived_reqs": [
+            "R-gw-rpc-pool-partition"
+          ],
+          "affects": [
+            "request_path"
+          ]
+        },
+        {
+          "id": "S-auth-cost-blindspot",
+          "description": "auth_check rejects requests (rate-limit, throttle flag, residency violation, key revoked) before any Subrole work happens. Currently no usage signal flows to usage_meter for rejected requests — the rejected work consumed gateway CPU and listener accept slots but is invisible to per-tenant cost accounting. A tenant under throttle generates ongoing rejected-traffic load that appears as 'free' load to the operator",
+          "attractor": "Tenants whose keys are flagged or revoked drive significant 'shadow' load that doesn't show up on their bill or in their tenant-metrics dashboard; operators see unattributed CPU on listener and auth_check; abuse detection (R-key-anomaly in parent) loses the rejected-traffic signal that would help it distinguish a leaked key from a legit-but-noisy one",
+          "breaking": true,
+          "solution": "auth_check emits a 'rejected-request' usage signal to usage_meter on every rejection (with reason: rate-limit, throttle, residency, revoked, malformed-auth) so usage_meter can attribute the rejection cost and feed key-anomaly detection. The rejected-cost is a separate metric from accepted-request cost so plan-ceiling logic doesn't double-count",
+          "derived_reqs": [
+            "R-gw-rejection-accounting"
+          ],
+          "affects": [
+            "auth_check"
+          ]
+        }
+      ]
+    }
+  ],
+  "active_session": null,
+  "schema_version": 2,
+  "needs_affects_backfill": []
+}

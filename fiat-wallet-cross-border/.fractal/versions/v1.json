@@ -1,0 +1,1460 @@
+{
+  "node_types": [
+    {
+      "name": "Client",
+      "definition": "Клиентское приложение, которым пользуется конечный пользователь кошелька",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "Service",
+      "definition": "Внутренний сервис кошелька, реализующий бизнес-логику или интеграцию",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "Store",
+      "definition": "Хранилище данных, владеемое одним сервисом и доступное другим только через него",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "ExternalSystem",
+      "definition": "Внешняя по отношению к кошельку система: партнёр, блокчейн или сторонний провайдер",
+      "layer": "epistatic",
+      "aspects": []
+    }
+  ],
+  "edge_types": [
+    {
+      "name": "calls",
+      "layer": "epistatic",
+      "from_types": [
+        "Service",
+        "Client"
+      ],
+      "to_types": [
+        "Service"
+      ]
+    },
+    {
+      "name": "reads_from",
+      "layer": "epistatic",
+      "from_types": [
+        "Service"
+      ],
+      "to_types": [
+        "Store"
+      ]
+    },
+    {
+      "name": "writes_to",
+      "layer": "epistatic",
+      "from_types": [
+        "Service"
+      ],
+      "to_types": [
+        "Store"
+      ]
+    },
+    {
+      "name": "integrates_with",
+      "layer": "epistatic",
+      "from_types": [
+        "Service"
+      ],
+      "to_types": [
+        "ExternalSystem"
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "mobile_app",
+      "node_type": "Client",
+      "definition": "Мобильное приложение пользователя — единственная клиентская поверхность кошелька; сканирует QR, инициирует депозиты и платежи, показывает историю",
+      "aspects": []
+    },
+    {
+      "id": "api_gateway",
+      "node_type": "Service",
+      "definition": "Точка входа клиентских запросов; терминирует TLS, валидирует JWT, маршрутизирует на внутренние сервисы",
+      "aspects": []
+    },
+    {
+      "id": "auth_service",
+      "node_type": "Service",
+      "definition": "Аутентификация пользователя, выпуск и проверка сессионных токенов, управление вторым фактором",
+      "aspects": []
+    },
+    {
+      "id": "kyc_service",
+      "node_type": "Service",
+      "definition": "Оркестратор KYC: запускает проверки у kyc_provider, хранит уровень верификации в user_db; уровни и требования к документам конфигурируются per-юрисдикция и применяются по правилу max(резидентство, использование)",
+      "aspects": []
+    },
+    {
+      "id": "wallet_service",
+      "node_type": "Service",
+      "definition": "Владелец USD-баланса пользователя: учитывает зачисления от депозитов и списания при платежах",
+      "aspects": []
+    },
+    {
+      "id": "deposit_service",
+      "node_type": "Service",
+      "definition": "Принимает входящие USDT (TRC-20) на TRON: считает депозит финализированным только после ≥ 20 подтверждений; перед зачислением вызывает aml_screening_service для on-chain скоринга и travel_rule_service для PII; депозит конвертируется в USD по реальной рыночной котировке через liquidity_router (выбирающего on-shore VASP по юрисдикции пользователя или off-shore партнёра); при halt-флаге от depeg_monitor приём временно блокируется",
+      "aspects": []
+    },
+    {
+      "id": "payment_service",
+      "node_type": "Service",
+      "definition": "Оркестрирует QR-платёж: парсит QR, проверяет лимиты схемы и merchant tier до фиксации курса, запрашивает у fx_service зафиксированную в окне TTL котировку, прогоняет платёжное намерение через risk_service (с возможностью step-up), списывает USD, передаёт исполнение payment_router (который имеет circuit-breaker и резерв партнёров), публикует события в event_bus и просит receipt_service оформить чек по правилам страны транзакции",
+      "aspects": []
+    },
+    {
+      "id": "fx_service",
+      "node_type": "Service",
+      "definition": "Получает котировки USD↔локальная валюта от fx_provider, фиксирует курс в окне TTL с явным margin поверх mid-rate (margin зависит от пары и волатильности), удерживает позиции в fx_position_store и применяет лимиты экспозиции",
+      "aspects": []
+    },
+    {
+      "id": "ledger_service",
+      "node_type": "Service",
+      "definition": "Реализует двойную запись для всех движений (депозит, конверсия USDT→USD, FX, платёж, рефанд, корректировки сверки), хранит originator/beneficiary PII по крипто-проводкам для Travel Rule, асинхронно публикует ledger-события в event_bus",
+      "aspects": []
+    },
+    {
+      "id": "user_db",
+      "node_type": "Store",
+      "definition": "Учётные записи пользователей, их KYC-уровни и идентификаторы у KYC-провайдера",
+      "aspects": []
+    },
+    {
+      "id": "wallet_db",
+      "node_type": "Store",
+      "definition": "USD-балансы пользователей и их персональные TRON-адреса для приёма USDT-депозитов; шардируется по user_id, чтобы локальный пик нагрузки не блокировал других пользователей",
+      "aspects": []
+    },
+    {
+      "id": "ledger_db",
+      "node_type": "Store",
+      "definition": "Журнал двойной записи и originator/beneficiary PII; шардируется по user_id; CQRS-разделение write/read для устойчивости к пикам",
+      "aspects": []
+    },
+    {
+      "id": "tron_node",
+      "node_type": "ExternalSystem",
+      "definition": "Узел блокчейна TRON, через который сервис депозитов наблюдает входящие USDT (TRC-20) транзакции",
+      "aspects": []
+    },
+    {
+      "id": "usdt_liquidity_partner",
+      "node_type": "ExternalSystem",
+      "definition": "Пул минимум из двух off-shore USDT/USD ликвидити-партнёров для юрисдикций без on-shore VASP-требований; liquidity_router выбирает между ними по курсу/доступности",
+      "aspects": []
+    },
+    {
+      "id": "fx_provider",
+      "node_type": "ExternalSystem",
+      "definition": "Внешний провайдер FX-котировок USD↔локальная валюта (THB, VND, BRL и др.) с гарантией удержания курса",
+      "aspects": []
+    },
+    {
+      "id": "kyc_provider",
+      "node_type": "ExternalSystem",
+      "definition": "Внешний поставщик идентификации, проверяющий документы, биометрию и санкционные списки",
+      "aspects": []
+    },
+    {
+      "id": "partner_th",
+      "node_type": "ExternalSystem",
+      "definition": "Пул минимум из двух независимых лицензированных эквайеров в Тайланде, подключённых к PromptPay/Thai QR; payment_router выбирает между ними по health-check и circuit-breaker",
+      "aspects": []
+    },
+    {
+      "id": "partner_vn",
+      "node_type": "ExternalSystem",
+      "definition": "Пул минимум из двух независимых лицензированных эквайеров во Вьетнаме (VietQR/NAPAS 247); payment_router маршрутизирует между ними",
+      "aspects": []
+    },
+    {
+      "id": "partner_br",
+      "node_type": "ExternalSystem",
+      "definition": "Пул минимум из двух независимых лицензированных Pix-эквайеров в Бразилии; payment_router маршрутизирует между ними",
+      "aspects": []
+    },
+    {
+      "id": "partner_global",
+      "node_type": "ExternalSystem",
+      "definition": "Пул минимум из двух независимых кросс-бордер партнёров (Alipay+/UPI и др.) для интероп QR-схем за пределами TH/VN/BR",
+      "aspects": []
+    },
+    {
+      "id": "vasp_partner_th",
+      "node_type": "ExternalSystem",
+      "definition": "Локально лицензированный VASP в Тайланде, выполняет on-shore конверсию USDT→THB в соответствии с требованиями BoT",
+      "aspects": []
+    },
+    {
+      "id": "vasp_partner_vn",
+      "node_type": "ExternalSystem",
+      "definition": "Локально лицензированный VASP во Вьетнаме, выполняет on-shore конверсию USDT→VND",
+      "aspects": []
+    },
+    {
+      "id": "vasp_partner_br",
+      "node_type": "ExternalSystem",
+      "definition": "Локально лицензированный VASP в Бразилии, выполняет on-shore конверсию USDT→BRL",
+      "aspects": []
+    },
+    {
+      "id": "travel_rule_provider",
+      "node_type": "ExternalSystem",
+      "definition": "Провайдер Travel Rule (TRP/Sumsub/Notabene), обменивающий PII контрагента между VASP по протоколу IVMS101",
+      "aspects": []
+    },
+    {
+      "id": "chain_analytics",
+      "node_type": "ExternalSystem",
+      "definition": "Внешний поставщик on-chain analytics (TRM/Chainalysis), оценивающий риск адресов и связей USDT-транзакций",
+      "aspects": []
+    },
+    {
+      "id": "fiscal_provider",
+      "node_type": "ExternalSystem",
+      "definition": "Провайдер локальной фискализации, генерирующий юридически валидные чеки/инвойсы по правилам страны транзакции (NF-e BR, VAT TH, e-invoice VN)",
+      "aspects": []
+    },
+    {
+      "id": "liquidity_router",
+      "node_type": "Service",
+      "definition": "Маршрутизирует свопы USDT в нужный канал: on-shore VASP-партнёр для TH/VN/BR-юрисдикций, off-shore usdt_liquidity_partner-пул для остальных; выбирает по политике курс/доступность",
+      "aspects": []
+    },
+    {
+      "id": "travel_rule_service",
+      "node_type": "Service",
+      "definition": "Координирует Travel Rule compliance: получает/отправляет originator-данные через travel_rule_provider, блокирует депозиты без необходимых данных",
+      "aspects": []
+    },
+    {
+      "id": "aml_screening_service",
+      "node_type": "Service",
+      "definition": "Скорит входящие USDT-адреса через chain_analytics; возвращает risk-уровень и решение clear/quarantine/return",
+      "aspects": []
+    },
+    {
+      "id": "depeg_monitor",
+      "node_type": "Service",
+      "definition": "Мониторит USDT/USD котировку, поднимает halt-флаг при отклонении выше порога; уведомляет пользователя ожидаемым курсом до подтверждения депозита",
+      "aspects": []
+    },
+    {
+      "id": "payment_router",
+      "node_type": "Service",
+      "definition": "Маршрутизирует QR-платёж к доступному партнёру в нужной юрисдикции; circuit-breaker, health-check, fallback на резервного партнёра",
+      "aspects": []
+    },
+    {
+      "id": "risk_service",
+      "node_type": "Service",
+      "definition": "Поведенческий скоринг каждого платёжного намерения и каждого нового получателя; выдаёт решения allow/step-up/deny",
+      "aspects": []
+    },
+    {
+      "id": "refund_service",
+      "node_type": "Service",
+      "definition": "Слушает события возврата от партнёров-эквайеров, выполняет обратную FX-конверсию и кредит USD-баланса с реверсной проводкой",
+      "aspects": []
+    },
+    {
+      "id": "reconciliation_service",
+      "node_type": "Service",
+      "definition": "Ежедневно сверяет settlement-отчёты от всех партнёров с ledger; алертит расхождения и пишет корректирующие проводки после operator-approve",
+      "aspects": []
+    },
+    {
+      "id": "receipt_service",
+      "node_type": "Service",
+      "definition": "Генерирует фискальный документ под формат страны транзакции (NF-e BR, VAT TH, e-invoice VN, общий чек в остальных) через fiscal_provider",
+      "aspects": []
+    },
+    {
+      "id": "event_bus",
+      "node_type": "Service",
+      "definition": "Внутренняя асинхронная шина событий: депозиты, платежи и побочные эффекты публикуются как события и потребляются заинтересованными сервисами",
+      "aspects": []
+    },
+    {
+      "id": "usdt_buffer",
+      "node_type": "Store",
+      "definition": "Ограниченный операционный USDT-пул на случай временной недоступности всех ликвидити-партнёров; имеет лимит и алерты на превышение порога удержания крипты",
+      "aspects": []
+    },
+    {
+      "id": "idempotency_store",
+      "node_type": "Store",
+      "definition": "Хранит идемпотентные ключи платёжных намерений и их статус, чтобы дедуплицировать ретраи и переключения партнёров",
+      "aspects": []
+    },
+    {
+      "id": "fx_position_store",
+      "node_type": "Store",
+      "definition": "Открытые FX-позиции по парам USD↔локальная валюта; используется fx_service для контроля экспозиции и применения лимитов",
+      "aspects": []
+    },
+    {
+      "id": "device_trust_store",
+      "node_type": "Store",
+      "definition": "Доверенные устройства пользователя, признаки fingerprint и история использования; читается auth_service и risk_service для оценки сессии",
+      "aspects": []
+    }
+  ],
+  "edges": [
+    [
+      "mobile_app",
+      "api_gateway",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "api_gateway",
+      "auth_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "api_gateway",
+      "kyc_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "api_gateway",
+      "wallet_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "api_gateway",
+      "payment_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "api_gateway",
+      "deposit_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "auth_service",
+      "user_db",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "auth_service",
+      "user_db",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "kyc_service",
+      "user_db",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "kyc_service",
+      "user_db",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "kyc_service",
+      "kyc_provider",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "wallet_service",
+      "wallet_db",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "wallet_service",
+      "wallet_db",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "wallet_service",
+      "ledger_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "deposit_service",
+      "tron_node",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "ledger_service",
+      "ledger_db",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "deposit_service",
+      "wallet_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "deposit_service",
+      "ledger_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "payment_service",
+      "wallet_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "payment_service",
+      "fx_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "payment_service",
+      "ledger_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "ledger_service",
+      "ledger_db",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "fx_service",
+      "fx_provider",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "deposit_service",
+      "liquidity_router",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "deposit_service",
+      "travel_rule_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "deposit_service",
+      "aml_screening_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "deposit_service",
+      "depeg_monitor",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "deposit_service",
+      "event_bus",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "liquidity_router",
+      "usdt_liquidity_partner",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "liquidity_router",
+      "vasp_partner_th",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "liquidity_router",
+      "vasp_partner_vn",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "liquidity_router",
+      "vasp_partner_br",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "liquidity_router",
+      "usdt_buffer",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "liquidity_router",
+      "usdt_buffer",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "travel_rule_service",
+      "travel_rule_provider",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "travel_rule_service",
+      "ledger_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "aml_screening_service",
+      "chain_analytics",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "depeg_monitor",
+      "usdt_liquidity_partner",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "payment_service",
+      "payment_router",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "payment_service",
+      "risk_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "payment_service",
+      "receipt_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "payment_service",
+      "event_bus",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "payment_router",
+      "partner_th",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "payment_router",
+      "partner_vn",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "payment_router",
+      "partner_br",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "payment_router",
+      "partner_global",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "payment_router",
+      "idempotency_store",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "payment_router",
+      "idempotency_store",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "risk_service",
+      "device_trust_store",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "auth_service",
+      "device_trust_store",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "auth_service",
+      "device_trust_store",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "fx_service",
+      "fx_position_store",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "fx_service",
+      "fx_position_store",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "refund_service",
+      "wallet_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "refund_service",
+      "ledger_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "refund_service",
+      "event_bus",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "refund_service",
+      "partner_th",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "refund_service",
+      "partner_vn",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "refund_service",
+      "partner_br",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "refund_service",
+      "partner_global",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "reconciliation_service",
+      "ledger_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "reconciliation_service",
+      "event_bus",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "reconciliation_service",
+      "partner_th",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "reconciliation_service",
+      "partner_vn",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "reconciliation_service",
+      "partner_br",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "reconciliation_service",
+      "partner_global",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "receipt_service",
+      "fiscal_provider",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "ledger_service",
+      "event_bus",
+      {
+        "edge_type": "calls"
+      }
+    ]
+  ],
+  "requirements": [
+    {
+      "id": "R-pay-qr-th",
+      "targets": [
+        {
+          "Node": "payment_service"
+        },
+        {
+          "Node": "partner_th"
+        }
+      ],
+      "description": "Пользователь оплачивает покупку у тайского торговца, сканируя Thai QR (PromptPay), а кошелёк списывает эквивалент в USD с баланса",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-pay-qr-vn",
+      "targets": [
+        {
+          "Node": "payment_service"
+        },
+        {
+          "Node": "partner_vn"
+        }
+      ],
+      "description": "Пользователь оплачивает покупку у вьетнамского торговца, сканируя VietQR (NAPAS 247), а кошелёк списывает эквивалент в USD с баланса",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-pay-qr-br",
+      "targets": [
+        {
+          "Node": "payment_service"
+        },
+        {
+          "Node": "partner_br"
+        }
+      ],
+      "description": "Пользователь оплачивает покупку у бразильского торговца, сканируя Pix QR (статический или динамический), а кошелёк списывает эквивалент в USD с баланса",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-pay-qr-cross",
+      "targets": [
+        {
+          "Node": "payment_service"
+        },
+        {
+          "Node": "partner_global"
+        }
+      ],
+      "description": "Пользователь оплачивает покупку за пределами TH/VN/BR, сканируя интероп QR (Alipay+/UPI и др.), и кошелёк списывает эквивалент в USD с баланса",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-topup-usdt",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        },
+        {
+          "Node": "tron_node"
+        }
+      ],
+      "description": "Пользователь пополняет кошелёк, отправив USDT (TRC-20) на свой персональный TRON-адрес, и кошелёк фиксирует факт депозита",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-conv-usdt-usd",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        },
+        {
+          "Node": "usdt_liquidity_partner"
+        }
+      ],
+      "description": "Полученный USDT мгновенно конвертируется в USD у ликвидити-партнёра, кошелёк сам криптовалюту длительно не хранит",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-balance-usd",
+      "targets": [
+        {
+          "Node": "wallet_service"
+        },
+        {
+          "Node": "wallet_db"
+        }
+      ],
+      "description": "Баланс пользователя ведётся в USD как единая валюта учёта; именно USD списывается при платеже до конверсии в локальный фиат",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-fx-usd-local",
+      "targets": [
+        {
+          "Node": "fx_service"
+        },
+        {
+          "Node": "fx_provider"
+        }
+      ],
+      "description": "При QR-платеже кошелёк фиксирует курс USD↔локальная валюта (THB/VND/BRL/др.) на момент инициации платежа и удерживает его до подтверждения",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-kyc",
+      "targets": [
+        {
+          "Node": "kyc_service"
+        },
+        {
+          "Node": "kyc_provider"
+        }
+      ],
+      "description": "Пользователь проходит KYC-верификацию до уровней, требуемых регуляторами целевых юрисдикций, прежде чем получить доступ к платежам",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-history",
+      "targets": [
+        {
+          "Node": "ledger_service"
+        },
+        {
+          "Node": "ledger_db"
+        }
+      ],
+      "description": "Пользователь видит историю всех своих операций (депозит, конверсия, FX, платёж торговцу) с чеками и выводимым по запросу детальным журналом",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-partner-acquiring",
+      "targets": [
+        {
+          "Node": "partner_th"
+        },
+        {
+          "Node": "partner_vn"
+        },
+        {
+          "Node": "partner_br"
+        },
+        {
+          "Node": "partner_global"
+        }
+      ],
+      "description": "Связь с локальными платёжными сетями PromptPay, VietQR, Pix и интероп QR идёт исключительно через лицензированных партнёров-эквайеров в соответствующей юрисдикции",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-vasp-jurisdiction",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        },
+        {
+          "Node": "usdt_liquidity_partner"
+        }
+      ],
+      "description": "On-shore USDT-операции в каждой юрисдикции с местным регулированием VASP идут через локально лицензированного VASP-партнёра, выбираемого по стране резидентства/использования",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-bot-vasp"
+      }
+    },
+    {
+      "id": "R-kyc-jurisdiction",
+      "targets": [
+        {
+          "Node": "kyc_service"
+        }
+      ],
+      "description": "KYC-уровни и требования к документам конфигурируются per-юрисдикция (TH/VN/BR/прочее) и применяются по правилу: уровень = max(требование страны резидентства, требование страны использования)",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-bot-vasp"
+      }
+    },
+    {
+      "id": "R-travel-rule",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        }
+      ],
+      "description": "Депозиты USDT, попадающие под порог Travel Rule, обрабатываются только при наличии originator-информации от контрагентского VASP; deposit_service блокирует или возвращает депозит, если данные не получены",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-travel-rule"
+      }
+    },
+    {
+      "id": "R-ledger-pii",
+      "targets": [
+        {
+          "Node": "ledger_service"
+        },
+        {
+          "Node": "ledger_db"
+        }
+      ],
+      "description": "Ledger хранит и обновляет originator/beneficiary PII по проводкам, относящимся к крипто-депозитам, для соответствия Travel Rule и AML-аудита",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-travel-rule"
+      }
+    },
+    {
+      "id": "R-liquidity-multi",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        },
+        {
+          "Node": "usdt_liquidity_partner"
+        }
+      ],
+      "description": "Кошелёк интегрируется минимум с двумя независимыми usdt_liquidity_partner и автоматически маршрутизирует свопы между ними по политике курс/доступность",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-liquidity-down"
+      }
+    },
+    {
+      "id": "R-usdt-buffer",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        }
+      ],
+      "description": "На случай временной недоступности всех ликвидити-партнёров кошелёк удерживает ограниченный USDT-буфер с лимитом и алертами; превышение лимита блокирует приём новых депозитов в данной юрисдикции",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-liquidity-down"
+      }
+    },
+    {
+      "id": "R-partner-redundancy",
+      "targets": [
+        {
+          "Node": "payment_service"
+        }
+      ],
+      "description": "Для каждой целевой юрисдикции (TH/VN/BR) кошелёк интегрируется минимум с двумя партнёрами-эквайерами и переключается между ними по health-check и circuit-breaker",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-partner-outage"
+      }
+    },
+    {
+      "id": "R-payment-idempotency",
+      "targets": [
+        {
+          "Node": "payment_service"
+        }
+      ],
+      "description": "Каждое платёжное намерение имеет уникальный idempotency-ключ; повторные ретраи и дубликаты от клиента сводятся к одной транзакции независимо от состояния партнёра",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-partner-outage"
+      }
+    },
+    {
+      "id": "R-usdt-real-rate",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        }
+      ],
+      "description": "USDT-депозиты конвертируются в USD по фактической рыночной котировке usdt_liquidity_partner, а не по номиналу 1:1; пользователь видит ожидаемый USD-зачёт перед подтверждением депозита",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-usdt-depeg"
+      }
+    },
+    {
+      "id": "R-depeg-halt",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        }
+      ],
+      "description": "При отклонении USDT/USD выше настроенного порога приём новых депозитов автоматически приостанавливается до восстановления стабильности",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-usdt-depeg"
+      }
+    },
+    {
+      "id": "R-fx-quote-window",
+      "targets": [
+        {
+          "Node": "fx_service"
+        },
+        {
+          "Node": "payment_service"
+        }
+      ],
+      "description": "FX-котировка действительна в течение явно ограниченного окна (TTL); при истечении до подтверждения платежа кошелёк запрашивает свежую котировку и требует повторное подтверждение пользователя",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-fx-slippage"
+      }
+    },
+    {
+      "id": "R-fx-margin",
+      "targets": [
+        {
+          "Node": "fx_service"
+        }
+      ],
+      "description": "Котировки покупателю отдаются с явным margin поверх mid-rate, размер margin per-валютная пара и зависит от волатильности; нетто-экспозиция fx_service ограничена позиционными лимитами",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-fx-slippage"
+      }
+    },
+    {
+      "id": "R-aml-screening",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        }
+      ],
+      "description": "Каждый входящий USDT-депозит проходит on-chain скоринг происхождения через chain-analytics-провайдера до конверсии в USD; депозиты выше порога риска карантинизируются",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-aml-dirty-usdt"
+      }
+    },
+    {
+      "id": "R-aml-quarantine",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        },
+        {
+          "Node": "ledger_service"
+        }
+      ],
+      "description": "Карантинизированные депозиты возвращаются на отправляющий адрес после ручного review или удерживаются для регуляторного запроса; ledger фиксирует факт карантина и его исход",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-aml-dirty-usdt"
+      }
+    },
+    {
+      "id": "R-confirmations",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        }
+      ],
+      "description": "Депозит USDT (TRC-20) считается финализированным и доступным к использованию только после порога безопасных подтверждений (≥ 20 блоков TRON); до этого средства видны как pending и нерасходуемы",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-tron-reorg"
+      }
+    },
+    {
+      "id": "R-refund",
+      "targets": [
+        {
+          "Node": "payment_service"
+        },
+        {
+          "Node": "wallet_service"
+        },
+        {
+          "Node": "ledger_service"
+        }
+      ],
+      "description": "Возвраты от торговца через любой партнёр-эквайер обрабатываются автоматически: обратная FX-конвертация в USD, кредит USD-баланса пользователя, реверсные проводки в ledger; пользователь получает уведомление",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-merchant-refund"
+      }
+    },
+    {
+      "id": "R-risk-scoring",
+      "targets": [
+        {
+          "Node": "payment_service"
+        },
+        {
+          "Node": "auth_service"
+        }
+      ],
+      "description": "Каждое платёжное намерение проходит оценку риска (поведение, гео, сумма, новый получатель); высокорисковые платежи требуют step-up подтверждения (биометрия + push на доверенном устройстве)",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-account-takeover"
+      }
+    },
+    {
+      "id": "R-step-up-auth",
+      "targets": [
+        {
+          "Node": "auth_service"
+        }
+      ],
+      "description": "Чувствительные операции (крупный платёж, изменение получателя, увеличение лимитов) требуют step-up аутентификации сверх стандартной сессии, с привязкой к device_trust",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-account-takeover"
+      }
+    },
+    {
+      "id": "R-reconciliation",
+      "targets": [
+        {
+          "Node": "ledger_service"
+        },
+        {
+          "Node": "payment_service"
+        }
+      ],
+      "description": "Settlement-отчёты от каждого партнёра-эквайера ежедневно сверяются с ledger по идемпотентному ключу платежа; расхождения поднимают алерт и инициируют корректирующие проводки после operator-approve",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-reconciliation-drift"
+      }
+    },
+    {
+      "id": "R-scheme-limits",
+      "targets": [
+        {
+          "Node": "payment_service"
+        }
+      ],
+      "description": "payment_service знает и проверяет известные лимиты QR-схемы и merchant tier до фиксации FX-курса; платежи, превышающие лимит, не принимаются или предлагают альтернативный сценарий пользователю",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-promptpay-limits"
+      }
+    },
+    {
+      "id": "R-async-fanout",
+      "targets": [
+        {
+          "Node": "payment_service"
+        },
+        {
+          "Node": "deposit_service"
+        },
+        {
+          "Node": "ledger_service"
+        }
+      ],
+      "description": "Побочные эффекты платежа и депозита (audit, нотификации, чеки, ledger-проводки) обрабатываются асинхронно через event_bus; критический путь до подтверждения пользователю остаётся коротким",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-load-spike"
+      }
+    },
+    {
+      "id": "R-shard-by-user",
+      "targets": [
+        {
+          "Node": "wallet_db"
+        },
+        {
+          "Node": "ledger_db"
+        }
+      ],
+      "description": "wallet_db и ledger_db шардированы по user_id, чтобы пик нагрузки в одной шарде не блокировал остальных пользователей",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-load-spike"
+      }
+    },
+    {
+      "id": "R-fiscal-receipts",
+      "targets": [
+        {
+          "Node": "ledger_service"
+        }
+      ],
+      "description": "Чеки выдаются в формате, требуемом юрисдикцией транзакции (NF-e для BR, VAT для TH, e-invoice для VN, общий receipt в остальных), через интеграцию с локальным fiscal-провайдером или партнёром-эквайером",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "S-tax-receipts"
+      }
+    }
+  ],
+  "satisfactions": [
+    {
+      "requirement_id": "R-pay-qr-th",
+      "explanation": "payment_service оркестрирует платёж, парсит Thai QR, фиксирует FX через fx_service и отправляет инструкцию partner_th, который зачисляет фиат торговцу через PromptPay"
+    },
+    {
+      "requirement_id": "R-pay-qr-vn",
+      "explanation": "payment_service отправляет инструкцию partner_vn, который зачисляет фиат торговцу через VietQR/NAPAS 247"
+    },
+    {
+      "requirement_id": "R-pay-qr-br",
+      "explanation": "payment_service отправляет инструкцию partner_br, который выполняет Pix-перевод торговцу"
+    },
+    {
+      "requirement_id": "R-pay-qr-cross",
+      "explanation": "payment_service отправляет инструкцию partner_global для интероп QR-схем (Alipay+/UPI и др.)"
+    },
+    {
+      "requirement_id": "R-topup-usdt",
+      "explanation": "deposit_service наблюдает входящие транзакции на TRON через tron_node и регистрирует депозит на ledger"
+    },
+    {
+      "requirement_id": "R-conv-usdt-usd",
+      "explanation": "deposit_service вызывает usdt_liquidity_partner для немедленного свопа USDT→USD сразу после фиксации депозита"
+    },
+    {
+      "requirement_id": "R-balance-usd",
+      "explanation": "wallet_service хранит и обновляет USD-баланс в wallet_db; payment_service и deposit_service дебетуют/кредитуют именно USD"
+    },
+    {
+      "requirement_id": "R-fx-usd-local",
+      "explanation": "fx_service запрашивает котировку у fx_provider, фиксирует курс на момент платежа и возвращает зафиксированный курс payment_service"
+    },
+    {
+      "requirement_id": "R-kyc",
+      "explanation": "kyc_service оркестрирует проверку через kyc_provider и хранит уровень верификации в user_db; api_gateway/auth_service блокируют операции без нужного уровня"
+    },
+    {
+      "requirement_id": "R-history",
+      "explanation": "ledger_service ведёт двойную запись всех движений в ledger_db; mobile_app получает историю и чеки через api_gateway"
+    },
+    {
+      "requirement_id": "R-partner-acquiring",
+      "explanation": "Все четыре partner_* — внешние лицензированные эквайеры в своих юрисдикциях; payment_service интегрируется только с ними, никогда напрямую с PromptPay/VietQR/Pix"
+    },
+    {
+      "requirement_id": "R-vasp-jurisdiction",
+      "explanation": "liquidity_router маршрутизирует свопы через локально лицензированный VASP (vasp_partner_th/vn/br) для соответствующей юрисдикции и через off-shore usdt_liquidity_partner-пул для остальных"
+    },
+    {
+      "requirement_id": "R-kyc-jurisdiction",
+      "explanation": "kyc_service хранит конфигурацию уровней per-юрисдикция и применяет правило max(резидентство, использование) — отражено в обновлённом definition"
+    },
+    {
+      "requirement_id": "R-travel-rule",
+      "explanation": "travel_rule_service интегрируется с travel_rule_provider; deposit_service вызывает его до зачисления и блокирует депозиты без originator-данных"
+    },
+    {
+      "requirement_id": "R-ledger-pii",
+      "explanation": "ledger_service пишет originator/beneficiary PII в проводки по крипто-депозитам — отражено в обновлённом definition; PII попадает в ledger через travel_rule_service→ledger_service"
+    },
+    {
+      "requirement_id": "R-liquidity-multi",
+      "explanation": "usdt_liquidity_partner — пул из двух+ независимых партнёров; liquidity_router маршрутизирует между ними"
+    },
+    {
+      "requirement_id": "R-usdt-buffer",
+      "explanation": "usdt_buffer (Store) хранит ограниченный USDT-пул; liquidity_router читает/пишет в него и применяет лимиты с алертами"
+    },
+    {
+      "requirement_id": "R-partner-redundancy",
+      "explanation": "Каждый partner_* — пул минимум из двух независимых лицензированных эквайеров; payment_router маршрутизирует между ними по health-check и circuit-breaker"
+    },
+    {
+      "requirement_id": "R-payment-idempotency",
+      "explanation": "payment_router использует idempotency_store для дедупликации платёжных намерений независимо от ретраев и переключения партнёров"
+    },
+    {
+      "requirement_id": "R-usdt-real-rate",
+      "explanation": "Депозиты конвертируются по реальной котировке через liquidity_router; deposit_service показывает ожидаемый USD-зачёт перед подтверждением — отражено в definition"
+    },
+    {
+      "requirement_id": "R-depeg-halt",
+      "explanation": "depeg_monitor отслеживает USDT/USD через usdt_liquidity_partner и поднимает halt-флаг; deposit_service приостанавливает приём при halt"
+    },
+    {
+      "requirement_id": "R-fx-quote-window",
+      "explanation": "fx_service фиксирует котировку в окне TTL и удерживает её; payment_service запрашивает свежую котировку при истечении — отражено в обновлённом definition"
+    },
+    {
+      "requirement_id": "R-fx-margin",
+      "explanation": "fx_service применяет margin поверх mid-rate и удерживает позиции в fx_position_store с лимитами экспозиции"
+    },
+    {
+      "requirement_id": "R-aml-screening",
+      "explanation": "aml_screening_service интегрируется с chain_analytics; deposit_service вызывает его до конверсии каждого депозита"
+    },
+    {
+      "requirement_id": "R-aml-quarantine",
+      "explanation": "aml_screening_service возвращает quarantine для высокорисковых; deposit_service инициирует возврат и пишет факт через ledger_service"
+    },
+    {
+      "requirement_id": "R-confirmations",
+      "explanation": "deposit_service зачисляет депозит только после ≥ 20 подтверждений TRON — отражено в обновлённом definition"
+    },
+    {
+      "requirement_id": "R-refund",
+      "explanation": "refund_service слушает события возврата от партнёров, делает обратную FX-конверсию через fx_service (вызывается через wallet_service), кредитует USD-баланс и пишет реверсные проводки"
+    },
+    {
+      "requirement_id": "R-risk-scoring",
+      "explanation": "risk_service скорит каждое платёжное намерение, используя device_trust_store; payment_service вызывает его и эскалирует на step-up при необходимости"
+    },
+    {
+      "requirement_id": "R-step-up-auth",
+      "explanation": "auth_service использует device_trust_store для оценки доверия устройства и инициирует step-up подтверждение по решению risk_service"
+    },
+    {
+      "requirement_id": "R-reconciliation",
+      "explanation": "reconciliation_service ежедневно интегрируется со всеми partner_* и сверяет с ledger_service; расхождения публикуются как события и инициируют корректирующие проводки"
+    },
+    {
+      "requirement_id": "R-scheme-limits",
+      "explanation": "payment_service проверяет лимиты схемы и merchant tier до фиксации курса — отражено в обновлённом definition"
+    },
+    {
+      "requirement_id": "R-async-fanout",
+      "explanation": "Все основные сервисы (payment, deposit, ledger, refund, reconciliation) публикуют события в event_bus; критический путь до подтверждения остаётся коротким"
+    },
+    {
+      "requirement_id": "R-shard-by-user",
+      "explanation": "wallet_db и ledger_db шардируются по user_id — отражено в обновлённых definitions; ledger_db также CQRS-разделён"
+    },
+    {
+      "requirement_id": "R-fiscal-receipts",
+      "explanation": "receipt_service интегрируется с fiscal_provider и генерирует юридически валидный чек по правилам страны транзакции (NF-e/VAT/e-invoice/общий)"
+    }
+  ]
+}

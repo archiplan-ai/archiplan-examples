@@ -1,0 +1,225 @@
+{
+  "problem": "Internal architecture of 'tip_quorum' (type: Subservice — Internal control-plane subservice running as part of the region_coordinator quorum across regions. Holds no canonical state outside the consensus substrate; mutations are proposed via quorum_core, reads come from state_log.). Node: Receives head observations from each region's chain_router (parent), authenticated via the cert-bearing surface and tagged with source replica identity. Per-source rate limits drop excess submissions and flag the source. (chain, fork_id) candidate admission requires N independent observations across N distinct regions (not merely N distinct chain_router replicas in the same region); multiple replicas in the same region count once for the threshold so colluding replicas within a region cannot satisfy the threshold alone. Below threshold the candidate is held in a probationary set. A probationary (chain, fork_id) candidate that exceeds a documented max-probationary-window without reaching the N-region threshold surfaces an alert listing the observed-region-set and the absent-region-set so operators can correlate against ongoing region-drain or rotation events. An operator-override admission path exists via lifecycle_gate: it accepts a CAS proposal that admits a probationary candidate over the threshold-shortfall, gated on the absent-region-set being explainable by current drain-in-progress or rotation-in-progress entries in control_lane; the override commits to tip_lane with operator attribution and is visible in subsequent reorg notifications. Computes the canonical tip per (chain, fork) by quorum across regional chain pools, excluding votes from pools currently in tip-stale state (read from tip_lane and control_lane). Detects reorgs and emits coherent rollback notifications keyed on chain coordinates committed via quorum_core into tip_lane. Source-quarantine rules include set-level cross-source correlation: a (chain, fork_id) candidate witnessed only by sources in suspicious correlation (synchronized timing, identical observation deltas, no other regional witness) is held probationary even when no single source violates per-source rate, and the correlated set is surfaced in alerts. Quarantines surface as alerts and exclude the quarantined source from quorum. On partition, minority-region tip_quorum buffers observations under a bounded watermark; on heal, observations replay with idempotency keys. (Realizes IR-per-fork-canonical-tip, IR-stale-pool-quorum-exclusion, IR-rollback-coherent and the tip-flood derivations.). Connections: lifecycle_gate --calls-> tip_quorum; tip_quorum --calls-> quorum_core; tip_quorum --calls-> hlc_service; tip_quorum --reads_from-> tip_lane; tip_quorum --reads_from-> control_lane. Parent requirements: IR-per-fork-canonical-tip: A single canonical-tip view per (chain, fork) is maintained by quorum across regional chain pools and reported as such; tenants subscribe to or query an explicit (chain, fork) pair.; IR-stale-pool-quorum-exclusion: Canonical-tip quorum excludes votes from any chain pool currently in tip-stale state, so a stalled regional pool cannot anchor the global canonical-tip view.; IR-rollback-coherent: Reorg rollback notifications are keyed on globally-meaningful chain coordinates so every region emits a coherent rollback regardless of when its local chain pool observed the reorg.; SR1-tip-source-rate-limit: Per-source rate limit on chain_router head-observation submissions to tip_quorum; observations beyond rate are dropped with a metric and source flagged.; SR1-fork-admission-threshold: A (chain, fork_id) candidate is admitted as a tracked pair only after N independent regional observations across a documented window; below threshold the fork_id is held in a probationary set and not committed to state_log.; SR1-tip-source-quarantine: tip_quorum quarantines chain_router replicas whose observation pattern violates per-source rate or cross-source-correlation rules; quarantines surface as alerts and are visible in the state_log so canonical-tip computation excludes the quarantined source.; SR2-probationary-timeout: tip_quorum surfaces an alert when a probationary (chain, fork_id) candidate exceeds a documented max-probationary-window without reaching the N-region admission threshold; the alert lists the observed-region-set and the absent-region-set so operators can correlate against ongoing region-drain or rotation events.; SR2-region-distinct-admission: tip_quorum's N independent observations for (chain, fork_id) admission must come from N distinct regions, not merely N distinct chain_router replicas; multiple replicas in the same region count once for the threshold so colluding replicas within a region cannot satisfy the threshold alone.; SR2-set-level-correlation: tip_quorum's source-quarantine rules include set-level cross-source correlation: a (chain, fork_id) candidate witnessed only by sources in suspicious correlation (synchronized timing, identical observation deltas, no other regional witness) is held probationary even when no single source violates per-source rate; the correlated set is surfaced in alerts.",
+  "current_version": 1,
+  "versions": [
+    {
+      "id": 0,
+      "note": "Naive internal architecture for tip_quorum",
+      "from_session": null,
+      "created_at": "2026-05-02T11:14:56.830059+00:00"
+    },
+    {
+      "id": 1,
+      "note": "v1: addressed Session 1 stressors (11 breaking, 1 survives, 21 derived reqs satisfied). observation_intake gained per-region aggregate-admission-rate ceiling, cert-age-floor admission-eligibility tagging, per-(chain, fork_id) hash partition + fair scheduling + per-key rate ceiling, retroactive quarantine-window markers, heal-batch tagging, per-shard backpressure exposure. fork_admission gained probationary-window eviction (not just alert), per-shard probationary_set capacity bound + oldest-first eviction + over-represented-region refusal, per-shard CAS batching, M-of-N operator-override quorum signing, strict full absent-region explanation gate, max-overrides-per-window rate limit, ineligible-but-correlation-counting observation handling. tip_computer gained CAS-stamp-and-validate of quarantined_source_set, tip_stale_set, canonical_tip_record reads (TOCTOU close), quarantine-window retroactive exclusion, in-proposal rollback construction (atomic with canonical commit), HLC-degraded suspend+defer, heal-batch coalesced recompute. rollback_emitter became an in-proposal step in tip_computer's CAS pipeline (no separate emitter race) with heal-batch coalesced rollback construction. tip_stale_tracker gained two-signal AND requirement (source-flag-rate AND hlc-freshness), max-concurrent-transitions cap, canonical-quorum-floor refusal gate, HLC-degraded freeze. One req bubbled to parent: lifecycle_gate operator-credential authorization model with M-of-N signing, rotation, compromise-revocation, audit. (from stress session 1)",
+      "from_session": 1,
+      "created_at": "2026-05-02T11:21:08.409130+00:00"
+    },
+    {
+      "id": 2,
+      "note": "v1 follow-up incidence",
+      "from_session": null,
+      "created_at": "2026-05-02T11:21:11.003733+00:00"
+    }
+  ],
+  "stress_sessions": [
+    {
+      "id": 1,
+      "against_version": 0,
+      "produced_version": 1,
+      "stressors": [
+        {
+          "id": "s-rotating-identity-flood",
+          "description": "Adversary controls many distinct chain_router-eligible identities (cert-bearing) and rotates through them at submission time so no single source identity exceeds the per-source rate limit. Each ephemeral identity submits a small burst, then a fresh identity submits the next burst, sustaining a high aggregate rate that observation_intake cannot rate-limit per-source. The flood targets a particular (chain, fork_id) candidate to push it through fork_admission's N-region threshold faster than legitimate observations would, or to drown the probationary_set with garbage candidates.",
+          "attractor": "Per-source rate limit becomes ineffective; observation_intake admits the flood; fork_admission's probationary_set bloats with adversary-driven candidates and/or a malicious (chain, fork_id) gets admitted via geographically-spread identity rotation. Memory pressure and false admissions both occur.",
+          "breaking": true,
+          "solution": "observation_intake adds a per-region aggregate-admission-rate ceiling on top of per-source rate (so identity rotation hits a regional ceiling); and only counts an identity's observations toward fork_admission's N-region threshold if the identity's cert is older than a documented cert-age-floor — fresh-identity flooding cannot reach the threshold.",
+          "derived_reqs": [
+            "SR3-per-region-aggregate-rate",
+            "SR3-cert-age-floor-for-admission"
+          ],
+          "affects": [
+            "observation_intake",
+            "fork_admission",
+            "probationary_set"
+          ]
+        },
+        {
+          "id": "s-quarantine-divergence",
+          "description": "observation_intake decides to quarantine a source (rate or correlation rule) and writes to quarantined_source_set via quorum_core CAS. There is a window between (a) observation_intake's local detection, (b) the CAS commit landing in tip_lane, and (c) tip_computer's read of quarantined_source_set. During this window observation_intake stops admitting from the source, but tip_computer is still counting recent observations from that source toward canonical-tip quorum (it has cached observations or the read view is stale). For an attack where the source manages to inject a final batch of bad observations right before quarantine, those observations skew the canonical tip and the rollback emitted afterward is incorrect.",
+          "attractor": "Canonical tip computed using already-flagged-suspicious observations; rollback emitted on a flawed canonical view; tip_computer's eventual quarantine-aware recompute would produce a second rollback with conflicting chain coordinates — incoherent rollback sequence visible to consumers.",
+          "breaking": true,
+          "solution": "tip_computer's canonical-tip CAS proposal includes the hlc_stamp at which it read the quarantined_source_set and quorum_core rejects the commit if quarantined_source_set has changed since that hlc_stamp; on rejection tip_computer re-reads quarantined_source_set and recomputes. Combined with retroactive-exclusion: when a source is newly quarantined, observation_intake also CAS-commits a quarantine-window marker carrying the hlc_stamp range over which that source's observations should be retroactively excluded (a documented look-back window); tip_computer reads the quarantine-window markers and excludes observations within those windows from quorum even if those observations were already admitted to tip_lane. So a final batch of bad observations is excluded before any rollback could be emitted.",
+          "derived_reqs": [
+            "SR3-quarantine-set-cas-stamping",
+            "SR3-retroactive-quarantine-window"
+          ],
+          "affects": [
+            "observation_intake",
+            "tip_computer",
+            "quarantined_source_set",
+            "rollback_emitter"
+          ]
+        },
+        {
+          "id": "s-probationary-orphan-leak",
+          "description": "A flood of (chain, fork_id) candidates each receive a small number of regional witnesses but never reach the N-region threshold and never trigger the max-probationary-window alert because they're below the per-fork threshold individually. Probationary_set grows unboundedly. Even worse: candidates that are abandoned by all witnessing regions (chain reorged past them naturally) leave orphan probationary entries with no eviction trigger because the max-probationary-window timer fires only as an alert, not as eviction.",
+          "attractor": "probationary_set grows without bound; tip_lane storage pressure; fork_admission read-path slows as it scans the probationary set on each candidate observation arrival; eventually a memory-pressure cascade through quorum_core / state_log.",
+          "breaking": true,
+          "solution": "fork_admission's max-probationary-window has both an alert role and an eviction role: a probationary candidate that exceeds the window without reaching threshold is evicted from probationary_set after the alert is surfaced (not simply alerted-and-retained); eviction is itself a CAS-committed probationary_set transition stamped with the alert id so operators can audit. A documented probationary_set capacity bound is enforced: once exceeded, fork_admission applies oldest-first eviction with an alert and refuses-and-flags new candidates from regions already over-represented in the probationary set, preventing flood-driven unbounded growth.",
+          "derived_reqs": [
+            "SR3-probationary-window-eviction",
+            "SR3-probationary-capacity-bound"
+          ],
+          "affects": [
+            "fork_admission",
+            "probationary_set"
+          ]
+        },
+        {
+          "id": "s-rollback-emit-toctou",
+          "description": "tip_computer signals rollback_emitter with chain coordinates of the divergence point, then before rollback_emitter constructs+commits the rollback notification, a second tip_computer iteration commits a new canonical tip (e.g. because more observations arrived rapidly during a high-churn reorg). rollback_emitter, working on the now-stale signal, constructs a rollback notification keyed on the OLD divergence coordinates and CAS-commits it, but the canonical_tip_record now reflects a different fork. Consumers see a rollback that doesn't match the latest canonical tip — incoherent.",
+          "attractor": "Rollback notification points to divergence coordinates that no longer match the current canonical_tip_record; tenant fanouts emit rollbacks for forks consumers were never on. Possible: a rollback storm where each fast canonical-tip change drives a separate (stale) rollback emission.",
+          "breaking": true,
+          "solution": "Already partly designed: rollback_emitter CAS-commits the rollback notification atomically alongside the new canonical-tip record (single CAS proposal). Strengthen: tip_computer constructs the rollback as part of its own canonical-tip CAS proposal — there is no separate rollback_emitter call path that can be raced. rollback_emitter becomes a co-located construction step within tip_computer's commit pipeline (still a distinct sub-role in code structure but not a separate CAS round-trip). The signal-then-emit interface is replaced by an in-proposal construction interface so the rollback and the new canonical tip are inherently atomic. tip_computer's CAS read of canonical_tip_record at the start of the proposal already guarantees the divergence coordinates match the previous canonical.",
+          "derived_reqs": [
+            "SR3-rollback-in-canonical-cas"
+          ],
+          "affects": [
+            "tip_computer",
+            "rollback_emitter",
+            "canonical_tip_record"
+          ]
+        },
+        {
+          "id": "s-tip-stale-false-positive",
+          "description": "tip_stale_tracker derives freshness from observation_intake's source-flag signals and from observation hlc-freshness. A burst of legitimate quarantines (e.g. a coordinated attack on multiple regions causing observation_intake to flag many sources) drives the freshness measure for several regions below threshold simultaneously. tip_stale_tracker transitions those regions to tip-stale; tip_computer then excludes them from canonical-tip quorum, leaving fewer regions in the quorum than the safe threshold (potentially below quorum). Healthy regions are wrongly excluded because their flag-rate signal correlated with attack defense, not legitimate stalls.",
+          "attractor": "Multiple healthy regions excluded from canonical-tip quorum simultaneously; canonical-tip quorum size falls below safe threshold; tip_quorum either produces a low-confidence tip from too-few regions or stalls entirely; cascading effect across (chain, fork) pairs that share the affected regions.",
+          "breaking": true,
+          "solution": "tip_stale_tracker uses two independent freshness signals (source-flag-rate AND hlc-observation-freshness) and requires BOTH to fall below threshold before transitioning a region to tip-stale; a high flag-rate alone is not sufficient. Additionally tip_stale_tracker enforces a max-concurrent-tip-stale-transitions cap: when more than M regions would transition to tip-stale within a documented window, transitions beyond the cap are deferred and an alert is surfaced — preventing simultaneous mass exclusion. Tip-stale transitions read tip_computer's current quorum-size proximity-to-threshold via canonical_tip_record (contributing-region-set count) and refuse the transition if it would push canonical-tip quorum below safe threshold (gated transition: surfaced as alert, not committed).",
+          "derived_reqs": [
+            "SR3-tip-stale-two-signals",
+            "SR3-tip-stale-mass-cap",
+            "SR3-tip-stale-quorum-floor-gate"
+          ],
+          "affects": [
+            "tip_stale_tracker",
+            "tip_stale_set",
+            "tip_computer"
+          ]
+        },
+        {
+          "id": "s-hot-fork-starvation",
+          "description": "A high-traffic (chain, fork) pair (e.g. mainnet ETH head fork) generates so many observations per second that observation_intake's processing pipeline is dominated by that key. Other (chain, fork) pairs — including newly-emerging fork candidates that need probationary admission — see their observations starved or queued behind the hot-key flow. fork_admission's probationary candidates for low-traffic chains languish; tip_computer's canonical-tip updates for those chains lag.",
+          "attractor": "Quiet chains' canonical tips lag while hot chains are processed in real time; per-tenant SLOs for non-hot chains are violated; new fork candidates on quiet chains can't reach N-region admission threshold within max-probationary-window because observations don't get through quickly enough.",
+          "breaking": true,
+          "solution": "observation_intake partitions its processing pipeline by (chain, fork_id) hash with per-partition fair scheduling: each partition gets a documented minimum-share of throughput; hot keys cannot fully starve cold keys. A per-(chain, fork) sustained-rate ceiling caps any single key's intake rate (excess shed with metric) so a hot fork cannot consume the entire pipeline; the ceiling is configurable per chain so well-known high-traffic chains have a higher cap than default.",
+          "derived_reqs": [
+            "SR3-per-key-fair-scheduling",
+            "SR3-per-key-rate-ceiling"
+          ],
+          "affects": [
+            "observation_intake",
+            "fork_admission"
+          ]
+        },
+        {
+          "id": "s-clock-skew-freshness",
+          "description": "tip_stale_tracker uses HLC freshness to decide whether a regional pool's observations are fresh; tip_computer also relies on HLC stamps for ordering. If hlc_service is in degraded mode (parent's SR2-hlc-degraded-interlock suspends security-critical orderings) but tip_stale_tracker is unaware, it could decide a region is tip-stale based on degraded-HLC stamps; or use stale HLC ticks. Conversely if hlc_service is healthy but a regional chain_router has cert-expiry issues so its hlc-stamps lag, tip_stale_tracker would correctly identify staleness, but a coordinated re-stamping retry from that region after recovery could drag the region across the threshold spuriously.",
+          "attractor": "tip_stale transitions made on degraded HLC; canonical-tip computation orders observations incorrectly during HLC degradation; healthy regions oscillate between tip-stale and fresh as HLC recovers.",
+          "breaking": true,
+          "solution": "tip_stale_tracker reads hlc_service's degraded-mode marker (control_lane lookup, mirroring SR2-hlc-degraded-interlock pattern) and freezes the tip-stale set during HLC-degraded mode: no new tip-stale transitions are committed and no existing tip-stale entries are evicted until HLC heals (existing entries remain conservative). tip_computer suspends canonical-tip CAS commits that depend on per-region HLC freshness during HLC-degraded mode (deferring updates to a documented bounded buffer mirroring the partition-degraded-mode pattern). Both behaviors are documented and tied to the parent HLC-degraded-interlock.",
+          "derived_reqs": [
+            "SR3-tip-stale-hlc-freeze",
+            "SR3-tip-computer-hlc-degraded-defer"
+          ],
+          "affects": [
+            "tip_stale_tracker",
+            "tip_computer",
+            "tip_stale_set"
+          ]
+        },
+        {
+          "id": "s-pipeline-backpressure",
+          "description": "Under heavy load, fork_admission's CAS commits to probationary_set (writes to tip_lane) become a contention point because all admitted observations flow through it. observation_intake admits faster than fork_admission can CAS-commit; observation_intake's bounded watermark fills (partition-degraded buffer pattern) and starts dropping observations from healthy sources. tip_computer in turn waits on probationary_set materialization. Backpressure cascades upward and downward through the pipeline.",
+          "attractor": "observation_intake drops legitimate observations under high load; fork_admission becomes a single CAS-throughput bottleneck even though candidates are independent; tip_computer's canonical-tip lag grows; the entire tip_quorum subsystem degrades under load it should be able to absorb.",
+          "breaking": true,
+          "solution": "fork_admission batches probationary_set updates by (chain, fork_id) shard and CAS-commits batched updates per-shard to amortize CAS overhead — independent shards do not contend with each other. observation_intake exposes a per-shard backpressure signal back to its upstream rate limiter so when one shard is contended the corresponding key's rate cap tightens (preserving headroom for other shards). The probationary_set capacity bound (SR3-probationary-capacity-bound) is enforced per-shard not global so localized hot keys don't starve others' admission slots.",
+          "derived_reqs": [
+            "SR3-fork-admission-shard-batching",
+            "SR3-shard-aware-backpressure"
+          ],
+          "affects": [
+            "observation_intake",
+            "fork_admission",
+            "tip_computer",
+            "probationary_set"
+          ]
+        },
+        {
+          "id": "s-operator-override-abuse",
+          "description": "The operator-override admission path (lifecycle_gate proxies a CAS proposal that admits a probationary candidate over the threshold-shortfall, gated on absent-region-set being explainable). A compromised operator credential or a misconfigured automation script issues an override admission for a malicious fork. fork_admission accepts the override because lifecycle_gate's gating check passes (perhaps a real drain happens to be in-progress for the absent regions). The malicious fork is admitted to canonical_tip_record with operator attribution; subsequent rollbacks point to it.",
+          "attractor": "Malicious (chain, fork_id) admitted via override; canonical-tip computation includes it; rollback emitted to align consumers with the malicious fork; visible operator attribution but damage is already propagated.",
+          "breaking": true,
+          "solution": "Local mitigations: fork_admission requires operator-override CAS proposals to carry M-of-N operator quorum signatures (not a single operator credential) — recorded with the override and visible in subsequent reorg notifications. The override is gated on a stricter check: absent-region-set must be FULLY explained (every absent region maps to a current drain or rotation entry in control_lane); partial explanations are rejected. fork_admission also enforces an override rate-limit (max overrides per window) and surfaces an alert when the limit is approached. The deeper concern — operator-credential compromise / authorization model for lifecycle_gate — is bubbled to parent scope.",
+          "derived_reqs": [
+            "SR3-override-mofn-quorum",
+            "SR3-override-strict-explanation",
+            "SR3-override-rate-limit"
+          ],
+          "affects": [
+            "fork_admission",
+            "canonical_tip_record",
+            "probationary_set"
+          ]
+        },
+        {
+          "id": "s-heal-replay-rollback-reorder",
+          "description": "On region partition observation_intake buffers observations under a bounded watermark and replays with idempotency keys on heal. After heal, the replay batch contains observations from before the partition. tip_computer processes them and discovers a divergence point that pre-dates the most-recent canonical-tip — a rollback must now be emitted to a chain coordinate before the current canonical. But the current canonical_tip_record points forward; emitting a rollback to a pre-current coordinate creates a non-monotonic rollback sequence (consumers expect rollbacks to chain coordinates monotonically progressing or at least matching the latest canonical's lineage).",
+          "attractor": "Rollback emitted to a pre-current chain coordinate confuses consumer fanouts; possible rollback storm as multiple replayed observations each trigger their own rollback; canonical_tip_record's coherence guarantee with rollback notifications (single CAS) is preserved per-step but the sequence of canonicals is non-monotonic from consumer perspective.",
+          "breaking": true,
+          "solution": "On heal-replay, observation_intake tags replay observations with a heal-batch marker. tip_computer recognizes heal-batch observations and processes the entire heal-batch as a single canonical-tip recompute, then emits a single coalesced rollback (if any) keyed on the deepest-divergence chain coordinate found in the batch. Mid-batch canonical-tip CAS commits are suppressed. The coalesced rollback is committed atomically with the post-batch canonical-tip record (preserving SR3-rollback-in-canonical-cas).",
+          "derived_reqs": [
+            "SR3-heal-batch-coalescing"
+          ],
+          "affects": [
+            "observation_intake",
+            "tip_computer",
+            "rollback_emitter",
+            "canonical_tip_record"
+          ]
+        },
+        {
+          "id": "s-override-during-tip-stale",
+          "description": "Operator issues an override admission for a probationary candidate. While the override CAS is in flight, tip_stale_tracker transitions one of the regions in observed-region-set to tip-stale. The override commits successfully (lifecycle_gate gate passed); but the region whose observation supported the override is now tip-stale, meaning had the override been re-checked it might no longer be needed (or the canonical-tip computed afterward excludes that region anyway).",
+          "attractor": "Override-admitted candidate's contributing-region-set may include a now-tip-stale region; canonical-tip quorum across regional pools either includes a tip-stale-region's vote (incoherent with IR-stale-pool-quorum-exclusion) or excludes it (override now potentially redundant or wrong). Audit trail unclear.",
+          "breaking": false,
+          "solution": null,
+          "derived_reqs": [],
+          "affects": [
+            "fork_admission",
+            "tip_computer",
+            "tip_stale_set"
+          ]
+        },
+        {
+          "id": "s-tip-stale-set-toctou",
+          "description": "Symmetric to s-quarantine-divergence: tip_computer reads tip_stale_set, computes canonical tip excluding tip-stale-region votes, and CAS-commits. Between the read and commit, tip_stale_tracker transitions another region to tip-stale (CAS-committed). The commit of canonical tip succeeds, but it included votes from a region that is now tip-stale — violating IR-stale-pool-quorum-exclusion at the moment of commit.",
+          "attractor": "Canonical-tip records committed with stale-region votes; IR-stale-pool-quorum-exclusion is a window-violation; consumers see canonical tips contributed by regions that are about to be (or already) flagged tip-stale.",
+          "breaking": true,
+          "solution": "Extend SR3-quarantine-set-cas-stamping to tip_stale_set: tip_computer's canonical-tip CAS proposal stamps the hlc_stamp at which it read tip_stale_set; quorum_core rejects the commit if tip_stale_set has changed since that hlc_stamp. On rejection tip_computer re-reads and recomputes. (One unified rule: any state-set whose contents affect canonical-tip computation is hlc-stamped on read and CAS-validated at commit.)",
+          "derived_reqs": [
+            "SR3-tip-stale-set-cas-stamping"
+          ],
+          "affects": [
+            "tip_computer",
+            "tip_stale_set",
+            "canonical_tip_record"
+          ]
+        }
+      ]
+    }
+  ],
+  "active_session": null,
+  "schema_version": 2,
+  "needs_affects_backfill": []
+}

@@ -1,0 +1,610 @@
+{
+  "node_types": [
+    {
+      "name": "Client",
+      "definition": "Клиентское приложение, которым пользуется конечный пользователь кошелька",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "Service",
+      "definition": "Внутренний сервис кошелька, реализующий бизнес-логику или интеграцию",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "Store",
+      "definition": "Хранилище данных, владеемое одним сервисом и доступное другим только через него",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "ExternalSystem",
+      "definition": "Внешняя по отношению к кошельку система: партнёр, блокчейн или сторонний провайдер",
+      "layer": "epistatic",
+      "aspects": []
+    }
+  ],
+  "edge_types": [
+    {
+      "name": "calls",
+      "layer": "epistatic",
+      "from_types": [
+        "Service",
+        "Client"
+      ],
+      "to_types": [
+        "Service"
+      ]
+    },
+    {
+      "name": "reads_from",
+      "layer": "epistatic",
+      "from_types": [
+        "Service"
+      ],
+      "to_types": [
+        "Store"
+      ]
+    },
+    {
+      "name": "writes_to",
+      "layer": "epistatic",
+      "from_types": [
+        "Service"
+      ],
+      "to_types": [
+        "Store"
+      ]
+    },
+    {
+      "name": "integrates_with",
+      "layer": "epistatic",
+      "from_types": [
+        "Service"
+      ],
+      "to_types": [
+        "ExternalSystem"
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "mobile_app",
+      "node_type": "Client",
+      "definition": "Мобильное приложение пользователя — единственная клиентская поверхность кошелька; сканирует QR, инициирует депозиты и платежи, показывает историю",
+      "aspects": []
+    },
+    {
+      "id": "api_gateway",
+      "node_type": "Service",
+      "definition": "Точка входа клиентских запросов; терминирует TLS, валидирует JWT, маршрутизирует на внутренние сервисы",
+      "aspects": []
+    },
+    {
+      "id": "auth_service",
+      "node_type": "Service",
+      "definition": "Аутентификация пользователя, выпуск и проверка сессионных токенов, управление вторым фактором",
+      "aspects": []
+    },
+    {
+      "id": "kyc_service",
+      "node_type": "Service",
+      "definition": "Оркестратор верификации личности: запускает проверки у KYC-провайдера и хранит уровень верификации пользователя",
+      "aspects": []
+    },
+    {
+      "id": "wallet_service",
+      "node_type": "Service",
+      "definition": "Владелец USD-баланса пользователя: учитывает зачисления от депозитов и списания при платежах",
+      "aspects": []
+    },
+    {
+      "id": "deposit_service",
+      "node_type": "Service",
+      "definition": "Отслеживает входящие USDT-переводы на TRON-адресах пользователей, инициирует мгновенный своп USDT→USD у ликвидити-партнёра и зачисление на баланс",
+      "aspects": []
+    },
+    {
+      "id": "payment_service",
+      "node_type": "Service",
+      "definition": "Оркестрирует QR-платежи: парсит QR, фиксирует FX-курс, списывает USD с баланса и отправляет инструкцию профильному локальному партнёру-эквайеру",
+      "aspects": []
+    },
+    {
+      "id": "fx_service",
+      "node_type": "Service",
+      "definition": "Получает котировки USD↔локальная валюта от FX-провайдера и фиксирует курс на момент платежа",
+      "aspects": []
+    },
+    {
+      "id": "ledger_service",
+      "node_type": "Service",
+      "definition": "Реализует двойную запись для всех движений: депозит, конверсия USDT→USD, FX USD→локальная, платёж торговцу",
+      "aspects": []
+    },
+    {
+      "id": "user_db",
+      "node_type": "Store",
+      "definition": "Учётные записи пользователей, их KYC-уровни и идентификаторы у KYC-провайдера",
+      "aspects": []
+    },
+    {
+      "id": "wallet_db",
+      "node_type": "Store",
+      "definition": "USD-балансы пользователей и их TRON-адреса для приёма USDT-депозитов",
+      "aspects": []
+    },
+    {
+      "id": "ledger_db",
+      "node_type": "Store",
+      "definition": "Журнал двойной записи: проводки, остатки счетов, историческая стоимость операций",
+      "aspects": []
+    },
+    {
+      "id": "tron_node",
+      "node_type": "ExternalSystem",
+      "definition": "Узел блокчейна TRON, через который сервис депозитов наблюдает входящие USDT (TRC-20) транзакции",
+      "aspects": []
+    },
+    {
+      "id": "usdt_liquidity_partner",
+      "node_type": "ExternalSystem",
+      "definition": "Внешний партнёр, обменивающий USDT на USD по согласованному курсу непосредственно в момент депозита",
+      "aspects": []
+    },
+    {
+      "id": "fx_provider",
+      "node_type": "ExternalSystem",
+      "definition": "Внешний провайдер FX-котировок USD↔локальная валюта (THB, VND, BRL и др.) с гарантией удержания курса",
+      "aspects": []
+    },
+    {
+      "id": "kyc_provider",
+      "node_type": "ExternalSystem",
+      "definition": "Внешний поставщик идентификации, проверяющий документы, биометрию и санкционные списки",
+      "aspects": []
+    },
+    {
+      "id": "partner_th",
+      "node_type": "ExternalSystem",
+      "definition": "Лицензированный партнёр-эквайер в Тайланде, подключённый к PromptPay/Thai QR; принимает инструкции и зачисляет фиат торговцу",
+      "aspects": []
+    },
+    {
+      "id": "partner_vn",
+      "node_type": "ExternalSystem",
+      "definition": "Лицензированный партнёр-эквайер во Вьетнаме, подключённый к VietQR/NAPAS 247",
+      "aspects": []
+    },
+    {
+      "id": "partner_br",
+      "node_type": "ExternalSystem",
+      "definition": "Лицензированный партнёр-эквайер в Бразилии, подключённый к Pix",
+      "aspects": []
+    },
+    {
+      "id": "partner_global",
+      "node_type": "ExternalSystem",
+      "definition": "Кросс-бордер партнёр-эквайер для интероп QR-схем (Alipay+/UPI и др.) за пределами трёх целевых стран",
+      "aspects": []
+    }
+  ],
+  "edges": [
+    [
+      "mobile_app",
+      "api_gateway",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "api_gateway",
+      "auth_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "api_gateway",
+      "kyc_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "api_gateway",
+      "wallet_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "api_gateway",
+      "payment_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "api_gateway",
+      "deposit_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "auth_service",
+      "user_db",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "auth_service",
+      "user_db",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "kyc_service",
+      "user_db",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "kyc_service",
+      "user_db",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "kyc_service",
+      "kyc_provider",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "wallet_service",
+      "wallet_db",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "wallet_service",
+      "wallet_db",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "wallet_service",
+      "ledger_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "deposit_service",
+      "tron_node",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "deposit_service",
+      "usdt_liquidity_partner",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "deposit_service",
+      "wallet_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "deposit_service",
+      "ledger_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "payment_service",
+      "wallet_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "payment_service",
+      "fx_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "payment_service",
+      "ledger_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "payment_service",
+      "partner_th",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "payment_service",
+      "partner_vn",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "payment_service",
+      "partner_br",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "payment_service",
+      "partner_global",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "fx_service",
+      "fx_provider",
+      {
+        "edge_type": "integrates_with"
+      }
+    ],
+    [
+      "ledger_service",
+      "ledger_db",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "ledger_service",
+      "ledger_db",
+      {
+        "edge_type": "reads_from"
+      }
+    ]
+  ],
+  "requirements": [
+    {
+      "id": "R-pay-qr-th",
+      "targets": [
+        {
+          "Node": "payment_service"
+        },
+        {
+          "Node": "partner_th"
+        }
+      ],
+      "description": "Пользователь оплачивает покупку у тайского торговца, сканируя Thai QR (PromptPay), а кошелёк списывает эквивалент в USD с баланса",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-pay-qr-vn",
+      "targets": [
+        {
+          "Node": "payment_service"
+        },
+        {
+          "Node": "partner_vn"
+        }
+      ],
+      "description": "Пользователь оплачивает покупку у вьетнамского торговца, сканируя VietQR (NAPAS 247), а кошелёк списывает эквивалент в USD с баланса",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-pay-qr-br",
+      "targets": [
+        {
+          "Node": "payment_service"
+        },
+        {
+          "Node": "partner_br"
+        }
+      ],
+      "description": "Пользователь оплачивает покупку у бразильского торговца, сканируя Pix QR (статический или динамический), а кошелёк списывает эквивалент в USD с баланса",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-pay-qr-cross",
+      "targets": [
+        {
+          "Node": "payment_service"
+        },
+        {
+          "Node": "partner_global"
+        }
+      ],
+      "description": "Пользователь оплачивает покупку за пределами TH/VN/BR, сканируя интероп QR (Alipay+/UPI и др.), и кошелёк списывает эквивалент в USD с баланса",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-topup-usdt",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        },
+        {
+          "Node": "tron_node"
+        }
+      ],
+      "description": "Пользователь пополняет кошелёк, отправив USDT (TRC-20) на свой персональный TRON-адрес, и кошелёк фиксирует факт депозита",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-conv-usdt-usd",
+      "targets": [
+        {
+          "Node": "deposit_service"
+        },
+        {
+          "Node": "usdt_liquidity_partner"
+        }
+      ],
+      "description": "Полученный USDT мгновенно конвертируется в USD у ликвидити-партнёра, кошелёк сам криптовалюту длительно не хранит",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-balance-usd",
+      "targets": [
+        {
+          "Node": "wallet_service"
+        },
+        {
+          "Node": "wallet_db"
+        }
+      ],
+      "description": "Баланс пользователя ведётся в USD как единая валюта учёта; именно USD списывается при платеже до конверсии в локальный фиат",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-fx-usd-local",
+      "targets": [
+        {
+          "Node": "fx_service"
+        },
+        {
+          "Node": "fx_provider"
+        }
+      ],
+      "description": "При QR-платеже кошелёк фиксирует курс USD↔локальная валюта (THB/VND/BRL/др.) на момент инициации платежа и удерживает его до подтверждения",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-kyc",
+      "targets": [
+        {
+          "Node": "kyc_service"
+        },
+        {
+          "Node": "kyc_provider"
+        }
+      ],
+      "description": "Пользователь проходит KYC-верификацию до уровней, требуемых регуляторами целевых юрисдикций, прежде чем получить доступ к платежам",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-history",
+      "targets": [
+        {
+          "Node": "ledger_service"
+        },
+        {
+          "Node": "ledger_db"
+        }
+      ],
+      "description": "Пользователь видит историю всех своих операций (депозит, конверсия, FX, платёж торговцу) с чеками и выводимым по запросу детальным журналом",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-partner-acquiring",
+      "targets": [
+        {
+          "Node": "partner_th"
+        },
+        {
+          "Node": "partner_vn"
+        },
+        {
+          "Node": "partner_br"
+        },
+        {
+          "Node": "partner_global"
+        }
+      ],
+      "description": "Связь с локальными платёжными сетями PromptPay, VietQR, Pix и интероп QR идёт исключительно через лицензированных партнёров-эквайеров в соответствующей юрисдикции",
+      "origin": {
+        "type": "Initial"
+      }
+    }
+  ],
+  "satisfactions": [
+    {
+      "requirement_id": "R-pay-qr-th",
+      "explanation": "payment_service оркестрирует платёж, парсит Thai QR, фиксирует FX через fx_service и отправляет инструкцию partner_th, который зачисляет фиат торговцу через PromptPay"
+    },
+    {
+      "requirement_id": "R-pay-qr-vn",
+      "explanation": "payment_service отправляет инструкцию partner_vn, который зачисляет фиат торговцу через VietQR/NAPAS 247"
+    },
+    {
+      "requirement_id": "R-pay-qr-br",
+      "explanation": "payment_service отправляет инструкцию partner_br, который выполняет Pix-перевод торговцу"
+    },
+    {
+      "requirement_id": "R-pay-qr-cross",
+      "explanation": "payment_service отправляет инструкцию partner_global для интероп QR-схем (Alipay+/UPI и др.)"
+    },
+    {
+      "requirement_id": "R-topup-usdt",
+      "explanation": "deposit_service наблюдает входящие транзакции на TRON через tron_node и регистрирует депозит на ledger"
+    },
+    {
+      "requirement_id": "R-conv-usdt-usd",
+      "explanation": "deposit_service вызывает usdt_liquidity_partner для немедленного свопа USDT→USD сразу после фиксации депозита"
+    },
+    {
+      "requirement_id": "R-balance-usd",
+      "explanation": "wallet_service хранит и обновляет USD-баланс в wallet_db; payment_service и deposit_service дебетуют/кредитуют именно USD"
+    },
+    {
+      "requirement_id": "R-fx-usd-local",
+      "explanation": "fx_service запрашивает котировку у fx_provider, фиксирует курс на момент платежа и возвращает зафиксированный курс payment_service"
+    },
+    {
+      "requirement_id": "R-kyc",
+      "explanation": "kyc_service оркестрирует проверку через kyc_provider и хранит уровень верификации в user_db; api_gateway/auth_service блокируют операции без нужного уровня"
+    },
+    {
+      "requirement_id": "R-history",
+      "explanation": "ledger_service ведёт двойную запись всех движений в ledger_db; mobile_app получает историю и чеки через api_gateway"
+    },
+    {
+      "requirement_id": "R-partner-acquiring",
+      "explanation": "Все четыре partner_* — внешние лицензированные эквайеры в своих юрисдикциях; payment_service интегрируется только с ними, никогда напрямую с PromptPay/VietQR/Pix"
+    }
+  ]
+}

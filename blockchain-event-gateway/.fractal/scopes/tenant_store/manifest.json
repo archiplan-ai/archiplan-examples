@@ -1,0 +1,254 @@
+{
+  "problem": "Internal architecture of 'tenant_store' (type: Store — A persistent data store that holds state across requests and process lifetimes). Node: Canonical multi-region store of tenants, API keys, plan tiers, tenant_cluster identity, residency policy, preservation holds, erasure tombstones, and rate-limit / quota state. Partitioned by tenant residency policy (residency-scoped, not globally replicated for residency-pinned tenants). Concurrent writes resolve under an explicit policy: per-key single-writer in the tenant's home region for adds/updates, with global tombstoned revocations that any region observes regardless of replication direction (tombstones are not subject to last-write-wins). Plan-change events (upgrade, downgrade, suspension) are stored and propagated as globally-ordered tombstones with an effective-from timestamp so any region's auth_cache and tenant_store hydration sees a consistent view of which plan is in force at any point in time. Tenant_cluster identity groups tenants by signup metadata, source-network fingerprints, behavioral signals, and query-pattern similarity; cluster assignment evolves as more behavioral signal accrues and cluster-level suspensions are tombstoned and propagate cross-region like key revocations. Preservation orders are recorded as tombstoned hold records keyed on (tenant, data_class, scope, time_range); held data is exempt from retention rotation and erasure of overlapping data is denied while a hold is in force. Tenant erasure requests are durable tombstones that propagate cross-region and produce a per-store deletion attestation aggregated into a verifiable certificate of deletion; preservation-erasure conflicts resolve under a documented preservation-wins policy. Once a tenant is offboarded and its erasure attestation is final, that tenant identity cannot be resurrected — attempts to reuse the id are rejected. Supports a documented 'extract for tenant T' operation returning only T's data, scoped to the residency policy in force, suitable for fulfilling a lawful-access or data-subject-access request without disclosing other tenants. Each region holds the partitions it is allowed to host. Internal channels to gateway, usage_meter, region_coordinator are cert-bearing surfaces enumerated in cert-inventory. Connections: gateway --reads_from-> tenant_store; usage_meter --reads_from-> tenant_store; usage_meter --writes_to-> tenant_store; region_coordinator --reads_from-> tenant_store. Parent requirements: R-tenant-store-replication: tenant_store state is replicated across regions with bounded lag; each region can authenticate and rate-limit using local replicas; R-tenant-store-conflict-resolution: Concurrent writes to tenant_store across regions resolve under an explicit, documented conflict-resolution policy (CRDT, partition by tenant home region, or write quorum) so that no key revocation can be 'un-revoked' by a conflicting concurrent write; R-revocation-tombstone: Key and tenant revocations are stored as tombstones with global ordering so any region's auth_cache hydration sees a revocation regardless of replication lag direction; R-residency-policy: Each tenant has an explicit residency policy that constrains the regions in which their tenant data, traffic, and derived telemetry may live; the system enforces this policy at the edge, in tenant_store partitioning, and in metrics_store / usage_meter sharding; R-plan-tombstone: Plan-change events (upgrade, downgrade, suspension) are stored and propagated as globally-ordered tombstones with an effective-from timestamp so any region's auth_cache and tenant_store hydration sees a consistent view of which plan is in force at any point in time, regardless of replication lag direction.; R-tenant-cluster-identity: The system models a tenant_cluster identity that groups tenants by signup metadata, source-network fingerprints, behavioral signals, and query-pattern similarity. Every tenant carries a current cluster id; cluster assignment evolves as more behavioral signal accrues.; R-cluster-suspension: Cluster-level suspensions (driven by abuse signal) are tombstoned and globally ordered like key revocations, propagate to every region's auth_cache via the same fast-path, and reject all member tenants' new requests with a documented 'cluster-suspended' rejection reason.; R-data-subject-extract: Every store holding tenant-attributable data (tenant_store, usage_meter, metrics_store, address_index, auth_cache hydration log) supports a documented 'extract for tenant T' operation returning only T's data, scoped to the residency policy in force, suitable for fulfilling a lawful-access or data-subject-access request without disclosing other tenants.; R-preservation-hold: Preservation orders are recorded as tombstoned hold records keyed on (tenant, data_class, scope, time_range); held data is exempt from retention rotation. Holds are globally ordered and propagate cross-region. While a hold is in force, erasure of overlapping data is denied with a documented reason.; R-erasure-tombstone: Tenant erasure requests are durable tombstones that propagate cross-region like revocations. Each store produces a verifiable per-store deletion attestation; the aggregate certificate of deletion is auditable. Erasure-preservation conflicts resolve under a documented preservation-wins policy.; R-no-tenant-resurrection: Once a tenant is offboarded and the erasure attestation is final, that tenant identity cannot be resurrected. Restoring service to the same human/organization requires a new tenant identity. Attempts to reuse an offboarded tenant id are rejected with a documented reason.",
+  "current_version": 2,
+  "versions": [
+    {
+      "id": 0,
+      "note": "tenant_store v0 — naive decomposition into 8 sub-nodes (tenant_record_store, tombstone_history_log, residency_partition_router, plan_version_timeline, preservation_hold_register, erasure_tombstone_log, tenant_cluster_identity_engine, audit_encryption_key_register); 12 inherited parent reqs satisfied; CRITICAL K̄=1.75 P̄=0.65",
+      "from_session": null,
+      "created_at": "2026-05-02T12:19:12.655696+00:00"
+    },
+    {
+      "id": 1,
+      "note": "tenant_store v1 — child stress session 1 closed; 15 stressors all breaking, 15 derived reqs satisfied. Sub-nodes redefined: tombstone_history_log (per-(tenant,event_kind) durable replay-checkpoints, archive-but-never-delete, deterministic preservation-first ordering, per-tenant terminal-state, idempotent replay-cursor + live-events-buffer protocol); residency_partition_router (sticky-deny stale-policy, write policy_version stamping + quarantine-and-relocate, complete-or-nothing DSAR, blacklist-gated onboarding); erasure_tombstone_log (canonical blacklist owner, four-phase destruction protocol, preservation_hold consultation before commit); plan_version_timeline (rebuilding-from-log status during rebuild, degraded-mode fallback); tenant_cluster_identity_engine (monotonic cluster_assignment_version, durable checkpoint before publication, deterministic HLC-as-of suspension); audit_encryption_key_register (two-phase rotation with overlap, four-phase destruction, audit chain key_id+generation); tenant_record_store (region_coordinator-issued lease tokens, fresh-lease-on-failover, replay reconciliation on heal); preservation_hold_register (hlc-as-of evaluation with grace, expiry-as-tombstone). 4 bubbles raised to parent: bubble-tenant_store-1 (lease tokens), bubble-tenant_store-2 (drain-fence-broadcast-and-ack), bubble-tenant_store-3 (policy_version 2PC), bubble-tenant_store-4 (compliance_audit composite cert).",
+      "from_session": 1,
+      "created_at": "2026-05-02T12:24:18.539637+00:00"
+    },
+    {
+      "id": 2,
+      "note": "tenant_store v2 — added epistemic scaffolding: SubsystemRole node type with role_log_of_record (tombstone_history_log, erasure_tombstone_log), role_derived_store (tenant_record_store, plan_version_timeline, preservation_hold_register), role_admission_router (residency_partition_router), role_lifecycle_engine (tenant_cluster_identity_engine, audit_encryption_key_register); categorized_as edge type. Spec-health warnings now all clean. NKP unchanged (epistemic does not affect NKP): K̄=1.75 P̄=0.65 CRITICAL.",
+      "from_session": null,
+      "created_at": "2026-05-02T12:25:28.400324+00:00"
+    }
+  ],
+  "stress_sessions": [
+    {
+      "id": 1,
+      "against_version": 0,
+      "produced_version": 1,
+      "stressors": [
+        {
+          "id": "ts-tombstone-compaction",
+          "description": "tombstone_history_log grows unbounded over time as every revocation, plan-change, suspension, hold, and erasure stays appended; storage cost diverges and replay-rebuild time becomes prohibitive — but tombstones are not subject to last-write-wins so naive compaction is forbidden.",
+          "attractor": "system tends toward unbounded log growth and ever-rising replay-rebuild times until either retention is silently broken (tombstones lost) or the log becomes the bottleneck of every sub-node restart.",
+          "breaking": true,
+          "solution": "tombstone_history_log adopts a multi-tier retention contract: the global ordering and tombstone semantics are preserved by per-(tenant, event_kind) checkpoint snapshots that are themselves immutable and signed; any tombstone older than the most recent durable replay-checkpoint of every dependent sub-node may be archived to cold storage but never deleted; replay always begins at the most recent shared checkpoint, not at zero.",
+          "derived_reqs": [
+            "R-ts-tombstone-checkpoint"
+          ],
+          "affects": [
+            "tombstone_history_log",
+            "plan_version_timeline"
+          ]
+        },
+        {
+          "id": "ts-residency-router-policy-skew",
+          "description": "residency_partition_router learns of policy_version V+1 from region_coordinator while in-flight writes are still tagged with V; some writes commit under V, some under V+1 within the same residency window; if V+1 reduces residency scope, V-tagged writes may have landed in a partition no longer permitted.",
+          "attractor": "system tends toward residency partitions polluted with stragglers from the previous policy_version; observers see drift between the in-force policy and the actual partition contents.",
+          "breaking": true,
+          "solution": "residency_partition_router tags every accepted write with the policy_version observed at admission; on policy_version change, in-flight writes admitted under V continue to commit under V; writes admitted under V+1 commit under V+1; reconciliation of any V-tagged write that landed in a partition no longer permitted under V+1 is a synchronous quarantine-and-relocate step before the policy_version transition is acknowledged to region_coordinator.",
+          "derived_reqs": [
+            "R-ts-write-policy-version-tag"
+          ],
+          "affects": [
+            "residency_partition_router",
+            "tenant_record_store"
+          ]
+        },
+        {
+          "id": "ts-preservation-vs-erasure-race",
+          "description": "A preservation-hold and an erasure tombstone for overlapping (tenant, data_class) arrive at the residency_partition_router within an HLC tick of each other; preservation_hold_register and erasure_tombstone_log both attempt their write — preservation-wins is required by parent, but the internal protocol must enforce it under simultaneous arrival regardless of which sub-node lands first.",
+          "attractor": "system tends toward race-dependent outcomes (whichever log lands first wins) violating the preservation-wins invariant; over time, certificates of deletion are issued for tenants whose data was under preservation.",
+          "breaking": true,
+          "solution": "all preservation_hold and erasure_tombstone cascades flow through tombstone_history_log first; tombstone_history_log enforces a deterministic per-(tenant, data_class) ordering rule: when a preservation_hold and an erasure_tombstone for overlapping scope are within the same HLC tick, preservation_hold is ordered first regardless of source-side timestamp, with the tie broken by event_kind precedence; erasure_tombstone_log MUST consult preservation_hold_register before committing and is rejected with documented reason if any active hold intersects.",
+          "derived_reqs": [
+            "R-ts-preservation-wins-protocol"
+          ],
+          "affects": [
+            "preservation_hold_register",
+            "erasure_tombstone_log",
+            "tombstone_history_log"
+          ]
+        },
+        {
+          "id": "ts-plan-timeline-rebuild",
+          "description": "plan_version_timeline is corrupted (disk fault, accidental purge, restart with stale snapshot); a rebuild must replay tombstone_history_log to reconstruct the (plan_version, effective_from_hlc) entries — but during rebuild gateway is reading the (now-empty) timeline and would see a missing-plan view.",
+          "attractor": "system tends toward plan-not-found rejection storms during rebuild; gateway/usage_meter see no-plan views and either reject all auth or fall back to a default plan, leaking access or rejection inconsistently.",
+          "breaking": true,
+          "solution": "plan_version_timeline rebuild is gated: while a rebuild is in progress, the sub-node returns a documented rebuilding-from-log status to readers (gateway/usage_meter), not an empty view; readers fall back to a documented degraded-mode (last-known plan from auth_cache hydration) rather than no-plan; rebuild streams replay from tombstone_history_log starting at the most recent durable plan-checkpoint and only flips back to serving once replay catches up to live HLC.",
+          "derived_reqs": [
+            "R-ts-plan-rebuild-degraded-mode"
+          ],
+          "affects": [
+            "plan_version_timeline",
+            "tombstone_history_log",
+            "tenant_record_store"
+          ]
+        },
+        {
+          "id": "ts-cluster-reassignment-inflight",
+          "description": "tenant_cluster_identity_engine reassigns tenant T from cluster A to cluster B at hlc t1; meanwhile a cluster-A suspension cascade arrives at hlc t2 where t1 < t2, and a cluster-B suspension cascade arrives at hlc t3 where t1 > t3 (in-flight cross-cluster signals); the engine must answer is-T-suspended deterministically across regions.",
+          "attractor": "system tends toward divergent is-T-suspended answers across regions during the reassignment window; tenant either escapes a cluster suspension by reassigning faster than propagation, or gets double-suspended by overlapping cascades.",
+          "breaking": true,
+          "solution": "tenant_cluster_identity_engine assigns each (tenant_id, cluster_id) reassignment a strictly-monotonic cluster_assignment_version per tenant; cluster-suspension cascades carry the cluster_id and an HLC; the engine answers is-T-suspended by: (a) resolve T cluster id at HLC, (b) check tombstone_history_log for any cluster suspension on that cluster_id whose HLC <= the read HLC. Cross-cluster cascades that arrive out of order are reordered by HLC at consumption time. Determinism is independent of arrival order.",
+          "derived_reqs": [
+            "R-ts-cluster-deterministic-suspension"
+          ],
+          "affects": [
+            "tenant_cluster_identity_engine",
+            "tenant_record_store",
+            "tombstone_history_log"
+          ]
+        },
+        {
+          "id": "ts-audit-key-destruction-ordering",
+          "description": "audit_encryption_key_register receives the destroy cascade from erasure_tombstone_log while compliance_audit at root still has unflushed audit writes referencing the tenant key in some operational write plane; if destruction occurs before drain, those audit writes become unrecoverable garbage; if destruction occurs after attestation, crypto-shred is unenforceable from the certificate of deletion.",
+          "attractor": "system tends toward either unrecoverable audit writes (destruction-before-drain) or unenforceable crypto-shred (destruction-after-attestation); the attestation becomes a lie either way.",
+          "breaking": true,
+          "solution": "erasure_tombstone_log drives a four-phase destruction protocol against audit_encryption_key_register: (1) erasure committed to log; (2) drain fence broadcast — every operational write plane (region_coordinator, chain_router, gateway, fanout, address_index, usage_meter) must ack drain-of-in-flight-audit-writes-for-tenant-T; (3) audit_encryption_key_register transitions key to DESTROYED only after all drain-acks are observed within an HLC-bounded window; (4) per-store erasure attestation is finalized only after key destruction is logged. Missing drain-ack blocks destruction (and thus attestation) with documented reason.",
+          "derived_reqs": [
+            "R-ts-audit-key-four-phase-destruction"
+          ],
+          "affects": [
+            "audit_encryption_key_register",
+            "erasure_tombstone_log"
+          ]
+        },
+        {
+          "id": "ts-tenant-record-split-brain",
+          "description": "A network partition isolates the home region of tenant T mid-write; under intra-region failover the standby in the home region promotes and accepts a new write; when the partition heals, the original primary still believes it is single-writer — both sides hold a divergent (plan, status, cluster_id) tuple for T.",
+          "attractor": "system tends toward divergent canonical records under healed partition; reads from different regions see different (plan, status, cluster) tuples for the same tenant; conflict resolution falls back to last-write-wins violating per-key single-writer.",
+          "breaking": true,
+          "solution": "tenant_record_store enforces single-writer-per-tenant via region_coordinator-issued lease tokens with HLC-bounded TTL; intra-region failover requires the standby to acquire a fresh lease (which the original primary cannot hold across the partition); writes without a current lease are rejected; on heal, only one side has a valid lease and the other side reconciles its local writes through tombstone_history_log replay.",
+          "derived_reqs": [
+            "R-ts-record-lease"
+          ],
+          "affects": [
+            "tenant_record_store"
+          ]
+        },
+        {
+          "id": "ts-dsar-extract-partial-availability",
+          "description": "A DSAR extract for tenant T arrives at residency_partition_router during a moment where preservation_hold_register or erasure_tombstone_log is unavailable (restart, partition); the router must either return a complete-or-nothing answer or signal partial-availability with a documented reason — a silent partial extract leaks the implicit fact that no holds exist when in fact the register is just down.",
+          "attractor": "system tends toward silently-incomplete extracts that satisfy the API contract but violate the legal contract — a DSAR responder cannot tell whether absence-of-hold means truly no hold or unknown.",
+          "breaking": true,
+          "solution": "residency_partition_router DSAR-extract is a complete-or-nothing operation: if any of (tenant_record_store, plan_version_timeline, preservation_hold_register, erasure_tombstone_log) cannot answer scoped to residency within an HLC-bounded freshness window, the extract returns extract-unavailable with the named unavailable sub-node; partial extracts are forbidden. The router also includes a freshness-of-each-sub-node block in the response so the consumer can audit completeness.",
+          "derived_reqs": [
+            "R-ts-dsar-complete-or-nothing"
+          ],
+          "affects": [
+            "residency_partition_router",
+            "preservation_hold_register",
+            "erasure_tombstone_log",
+            "tenant_record_store"
+          ]
+        },
+        {
+          "id": "ts-tombstone-replay-on-restart",
+          "description": "A sub-node restarts (e.g. plan_version_timeline or tenant_cluster_identity_engine) and must replay tombstone_history_log from a checkpoint; while replay is in progress, the sub-node serves stale data; concurrent live cascades from tombstone_history_log arriving during replay must not be lost or double-applied.",
+          "attractor": "system tends toward double-application or skipped events during the replay-overlap window; sub-node state diverges from the log of record after every restart.",
+          "breaking": true,
+          "solution": "every replay-from-log is idempotent-keyed on (tenant, event_kind, hlc, originator_id); during replay, the sub-node maintains a replay-cursor and a live-events buffer; live cascades arriving during replay are buffered and applied strictly after the replay-cursor passes their HLC; replay completion publishes the cursor as the new durable checkpoint.",
+          "derived_reqs": [
+            "R-ts-replay-idempotency"
+          ],
+          "affects": [
+            "plan_version_timeline",
+            "tenant_cluster_identity_engine",
+            "tombstone_history_log"
+          ]
+        },
+        {
+          "id": "ts-no-resurrection-blacklist-owner",
+          "description": "A tenant id reuse attempt arrives at residency_partition_router; which sub-node owns the offboarded-id-blacklist? erasure_tombstone_log carries it but tenant_record_store onboarding is the entry point; without a documented gating contract, an onboarding write could land in tenant_record_store before the blacklist is consulted.",
+          "attractor": "system tends toward an onboarding race where an offboarded id can be reused if the blacklist consultation is not strictly gating; over time, ghost tenants reappear.",
+          "breaking": true,
+          "solution": "erasure_tombstone_log is the canonical owner of the offboarded-id blacklist; residency_partition_router gates every onboarding write to tenant_record_store by consulting erasure_tombstone_log first; an onboarding write whose tenant_id appears in the blacklist is rejected with documented reason at the router, never reaching tenant_record_store.",
+          "derived_reqs": [
+            "R-ts-blacklist-gate"
+          ],
+          "affects": [
+            "erasure_tombstone_log",
+            "tenant_record_store",
+            "residency_partition_router"
+          ]
+        },
+        {
+          "id": "ts-cluster-engine-crashloop",
+          "description": "tenant_cluster_identity_engine crashes and restarts repeatedly while behavioral signals continue to flow in; reassignment events queue up and replay-on-restart applies them in batch — if the engine is the source of monotonic cluster_version, a crashloop can leave the version sequence with gaps or duplicates that downstream tenant_record_store hydration cannot reconcile.",
+          "attractor": "system tends toward gaps or duplicates in cluster_version sequence; downstream sees jittering cluster ids for the same tenant; auth_cache fast-path can flip between suspended and not-suspended.",
+          "breaking": true,
+          "solution": "tenant_cluster_identity_engine durably checkpoints (tenant_id, cluster_assignment_version) before publishing the writes_to to tenant_record_store; on restart, replay-from-checkpoint never re-issues a version already published; cluster_assignment_version generation is monotonic-per-tenant and the engine refuses to advance past the durable checkpoint without confirmed publication. Repeated crashloops bounded-retry the same version rather than emitting a new one.",
+          "derived_reqs": [
+            "R-ts-cluster-version-checkpoint"
+          ],
+          "affects": [
+            "tenant_cluster_identity_engine",
+            "tenant_record_store"
+          ]
+        },
+        {
+          "id": "ts-residency-router-stale-read",
+          "description": "residency_partition_router has a cached policy_version but the live tenant_record_store partition has been quietly relocated by a residency policy change V+1 that has not yet propagated to the router; reads return data scoped to the old residency partition, leaking data outside the new residency boundary.",
+          "attractor": "system tends toward residency-bypass during the stale window — reads (DSAR, gateway hydration) return data from the no-longer-permitted partition; this is exactly what residency policy is meant to prevent.",
+          "breaking": true,
+          "solution": "residency_partition_router treats its policy_version as a sticky deny-by-default cache: reads served against a stale policy_version (i.e. older than region_coordinator latest acked) are blocked with a stale-policy reason rather than returning data; the router refreshes policy_version via push-and-acknowledge from region_coordinator and short-circuits to deny while a refresh is in flight.",
+          "derived_reqs": [
+            "R-ts-router-sticky-deny"
+          ],
+          "affects": [
+            "residency_partition_router",
+            "tenant_record_store"
+          ]
+        },
+        {
+          "id": "ts-key-rotation-during-read",
+          "description": "audit_encryption_key_register is mid-rotation (old key marked ROTATED, new key ISSUED) when an in-flight audit write or audit read references the (tenant, key_generation) pair; if both old and new are accepted simultaneously, audit chain integrity becomes ambiguous; if only new is accepted, in-flight writes signed under the old key are rejected.",
+          "attractor": "system tends toward audit-chain ambiguity during rotation overlap; either dropped writes or duplicated/uncorrelatable audit entries.",
+          "breaking": true,
+          "solution": "audit_encryption_key_register rotation is a two-phase transition with explicit overlap window: (a) new key ISSUED, both new and old accepted for in-flight; (b) HLC-bounded grace, old key transitioned to ROTATED, new is sole writer; (c) only after grace expires can old key be eligible for any DESTROYED transition. All audit chain entries record (tenant, key_id, generation) so verifiers can resolve which key was in force at each HLC.",
+          "derived_reqs": [
+            "R-ts-key-rotation-overlap"
+          ],
+          "affects": [
+            "audit_encryption_key_register",
+            "erasure_tombstone_log"
+          ]
+        },
+        {
+          "id": "ts-tombstone-log-causality-violation",
+          "description": "tombstone_history_log accepts a plan-change tombstone with effective_from_hlc T and an erasure tombstone with hlc T+epsilon for the same tenant; the erasure cascades destroy the audit-key but the plan-change cascade still arrives at plan_version_timeline after the tenant has been erased; cascade ordering with respect to the tenant lifecycle terminal-state is not enforced internally.",
+          "attractor": "system tends toward post-erasure plan-change events that should never have been applied; tenant terminal-state is not actually terminal.",
+          "breaking": true,
+          "solution": "tombstone_history_log enforces a per-tenant terminal-state: once an erasure tombstone for tenant T is committed at HLC T_e, any subsequent cascade (plan-change, suspension, hold, etc.) for that tenant whose HLC > T_e is rejected at the log with documented post-erasure reason; cascades whose HLC < T_e but arrive late are applied to a frozen-projection only used for audit reconstruction, never to live tenant_record_store / plan_version_timeline.",
+          "derived_reqs": [
+            "R-ts-post-erasure-rejection"
+          ],
+          "affects": [
+            "tombstone_history_log",
+            "plan_version_timeline",
+            "erasure_tombstone_log",
+            "tenant_record_store"
+          ]
+        },
+        {
+          "id": "ts-preservation-hold-expiry",
+          "description": "preservation_hold_register holds a (tenant, data_class) entry with a time_range that has just expired; an erasure cascade arrives the moment after expiry; without an explicit expiry-grace-window the system races: was the hold valid at the cascade hlc? Different observers reading slightly different clocks may answer differently.",
+          "attractor": "system tends toward race-dependent erasure-vs-expiring-hold outcomes; observers disagree.",
+          "breaking": true,
+          "solution": "preservation_hold_register evaluates hold-active under a documented hlc-as-of policy: an incoming erasure cascade carries an admission_hlc, and the hold is treated as active iff its time_range encompasses admission_hlc with a documented grace-window appended; expiry is itself a tombstone written to tombstone_history_log so observers see a consistent expiry hlc.",
+          "derived_reqs": [
+            "R-ts-hold-expiry-tombstone"
+          ],
+          "affects": [
+            "preservation_hold_register",
+            "erasure_tombstone_log"
+          ]
+        }
+      ]
+    }
+  ],
+  "active_session": null,
+  "schema_version": 2,
+  "needs_affects_backfill": []
+}

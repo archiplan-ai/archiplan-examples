@@ -1,0 +1,818 @@
+{
+  "node_types": [
+    {
+      "name": "Subservice",
+      "definition": "Internal sub-component of tip_quorum running co-located within the region_coordinator quorum; holds no canonical state outside the consensus substrate; mutations are CAS-proposed via quorum_core and reads come from state_log lanes.",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "StateSet",
+      "definition": "A logical set or index over consensus-committed entries derived from state_log lanes; not a separately persisted store but a materialized view used by sub-roles.",
+      "layer": "epistatic",
+      "aspects": []
+    }
+  ],
+  "edge_types": [
+    {
+      "name": "calls",
+      "layer": "epistatic",
+      "from_types": [
+        "Subservice"
+      ],
+      "to_types": [
+        "Subservice"
+      ]
+    },
+    {
+      "name": "reads_from",
+      "layer": "epistatic",
+      "from_types": [
+        "Subservice"
+      ],
+      "to_types": [
+        "StateSet"
+      ]
+    },
+    {
+      "name": "writes_to",
+      "layer": "epistatic",
+      "from_types": [
+        "Subservice"
+      ],
+      "to_types": [
+        "StateSet"
+      ]
+    },
+    {
+      "name": "derives",
+      "layer": "epistatic",
+      "from_types": [
+        "Subservice"
+      ],
+      "to_types": [
+        "StateSet"
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "observation_intake",
+      "node_type": "Subservice",
+      "definition": "Per-source authentication + rate limiting + quarantine for incoming head observations from each region's chain_router. Validates the cert-bearing surface, tags each submission with source replica identity, applies per-source rate limits (drops excess and flags the source). On top of per-source rate, enforces a per-region aggregate-admission-rate ceiling so identity-rotation flooding from a single region is bounded even when each ephemeral identity stays under per-source rate; the regional ceiling and the offending region surface as alerts. Records each accepted observation with cert-age metadata; observations from identities whose cert age is below the documented cert-age-floor are accepted but tagged admission-eligibility=ineligible so fork_admission excludes them from N-region threshold counting. Partitions its processing pipeline by (chain, fork_id) hash with per-partition fair scheduling (each partition gets a documented minimum throughput share) and enforces a per-(chain, fork_id) sustained-rate ceiling (per-chain-configurable) so a hot fork cannot dominate the pipeline; per-shard backpressure signals from fork_admission tighten the corresponding key's rate cap (bounded by a per-shard minimum so legitimate updates are not totally starved). Enforces source quarantine: replicas violating per-source rate, per-region rate, or set-level cross-source-correlation rules are quarantined; quarantine writes the quarantined_source_set as a CAS-committed entry in tip_lane via quorum_core, with an accompanying quarantine-window marker carrying the hlc_stamp range over which the source's observations are retroactively excluded from canonical-tip quorum. On region partition, buffers observations under a bounded watermark; on heal, replays observations tagged with a heal-batch marker so tip_computer can coalesce reorg processing. Forwards admitted observations to fork_admission tagged with (source_id, region_id, chain, fork_id, observation_payload, hlc_stamp from hlc_service, admission-eligibility, heal-batch-id-or-null).",
+      "aspects": []
+    },
+    {
+      "id": "fork_admission",
+      "node_type": "Subservice",
+      "definition": "Multi-source fork admission via probationary set + N-region observation threshold. Receives admitted observations from observation_intake. Maintains a probationary set of (chain, fork_id) candidates keyed by observed-region-set; admits a candidate as a tracked pair only when N distinct regions (not merely N distinct chain_router replicas) have witnessed it within a documented window. Counts only observations whose admission-eligibility tag is eligible (cert-age above floor) toward the N-region threshold; ineligible observations contribute to set-level correlation but not to threshold. Below threshold the candidate stays probationary and is not committed to tip_lane. Set-level cross-source correlation rule: candidates witnessed only by sources in suspicious correlation (synchronized timing, identical observation deltas, no other regional witness) stay probationary even when no single source violates per-source rate, and the correlated set is surfaced in alerts. Surfaces an alert when a probationary candidate exceeds the documented max-probationary-window without reaching N regions, listing observed-region-set and absent-region-set; on window expiry the candidate is also evicted from probationary_set (eviction is a CAS-committed transition stamped with the alert id for audit). Enforces a per-shard documented probationary_set capacity bound; on overflow, oldest-first eviction with alert is applied and new probationary candidates from regions already over-represented in that shard are refused-and-flagged. Batches probationary_set CAS commits per (chain, fork_id) shard so independent shards do not contend on a single CAS line (documented bounded-latency-vs-throughput tradeoff). Accepts an operator-override admission path proxied via lifecycle_gate: a CAS proposal that admits a probationary candidate over the threshold-shortfall, gated on the absent-region-set being FULLY explained (every absent region maps to a current drain-in-progress or rotation-in-progress entry in control_lane; partial explanations are rejected and the unexplained regions surface as override-attempt alerts). Override CAS proposals must carry M-of-N operator quorum signatures (configurable threshold; signing operators recorded with the override and visible in subsequent reorg notifications and audit). Enforces a documented max-overrides-per-window rate limit; approaching surfaces an alert, exceeding rejects further overrides with a documented error code.",
+      "aspects": []
+    },
+    {
+      "id": "tip_computer",
+      "node_type": "Subservice",
+      "definition": "Computes the canonical tip per (chain, fork) by quorum across regional chain pools. Reads admitted candidates from canonical_tip_record (materialized via tip_lane), the tip_stale_set (derived by tip_stale_tracker), the quarantined_source_set, and quarantine-window markers (from observation_intake) — excludes votes from regions in tip-stale state, votes from sources currently in quarantined_source_set, and observations from any source within its retroactive quarantine-window marker hlc_stamp range. Stamps each canonical-tip CAS proposal with the hlc_stamps at which it read quarantined_source_set, tip_stale_set, and canonical_tip_record; quorum_core rejects the commit if any of those state sets has changed since its read hlc_stamp, on rejection tip_computer re-reads and recomputes (preserving exclusion guarantees at commit time, not just read time). Detects reorgs by comparing the new canonical against the previously committed canonical_tip_record entry; on reorg, the rollback notification is constructed in-proposal (no separate signal-then-emit round-trip) so the rollback and the new canonical-tip record commit atomically in a single CAS proposal. Stamped with hlc_service. On hlc_service degraded mode, suspends canonical-tip CAS commits that depend on per-region HLC freshness and defers updates to a bounded buffer that replays after HLC heals; suspended state surfaces as an alert. Recognizes heal-batch-tagged observations from observation_intake and processes the entire heal-batch as a single canonical-tip recompute, suppressing mid-batch CAS commits and emitting a single coalesced rollback (if any) keyed on the deepest divergence in the batch.",
+      "aspects": []
+    },
+    {
+      "id": "rollback_emitter",
+      "node_type": "Subservice",
+      "definition": "Chain-coordinate-keyed rollback notification construction. Operates as an in-proposal step within tip_computer's canonical-tip CAS pipeline rather than as a separate post-hoc emitter — no signal-then-emit round-trip, no race window. On reorg detected by tip_computer, constructs a rollback notification keyed on globally-meaningful chain coordinates (chain, divergence_block_coordinate, new_fork_id) so every region emits a coherent rollback regardless of when its local pool observed the reorg. The rollback notification is included in tip_computer's single CAS proposal alongside the new canonical-tip record so consumers cannot observe a new canonical tip without the corresponding rollback (and vice-versa). Stamped with hlc_service. Includes operator attribution (and signing M-of-N operator identities) when the underlying admission was an operator-override. For heal-batch processing, constructs a single coalesced rollback for the entire batch (keyed on the deepest divergence found in the batch) rather than one rollback per replayed observation — preserving rollback monotonicity from the consumer perspective.",
+      "aspects": []
+    },
+    {
+      "id": "tip_stale_tracker",
+      "node_type": "Subservice",
+      "definition": "Derives the tip-stale set consumed by tip_computer. For each regional chain pool, derives two independent freshness signals: (a) source-flag-rate from observation_intake (rate of quarantined / flagged sources within the region) and (b) hlc-observation-freshness (comparing recent admitted observations' hlc_stamps to the global hlc_service tick). Transitions a region to tip-stale only when BOTH signals fall below documented thresholds; a single signal alone (e.g. a coordinated quarantine burst affecting flag-rate) is insufficient — preventing false-positive cascades during attack defense. Enforces a max-concurrent-tip-stale-transitions cap within a documented window: transitions beyond the cap are deferred and an alert lists the deferred regions and their freshness measures. Before committing a tip-stale transition, reads canonical_tip_record's contributing-region-set count and refuses the transition if it would push canonical-tip quorum below the documented safe threshold (refusal surfaces as an alert listing the (chain, fork) pairs at risk). Reads control_lane for region-drain entries (regions in drain are treated as legitimately tip-stale, no false-positive cascade) and pause-class entries (VM live migration suppresses tip-stale transitions for the documented pause window). On hlc_service degraded mode, freezes the tip_stale_set: no new tip-stale transitions are committed and no existing entries evicted until HLC heals; existing entries remain conservatively in place. Transitions are CAS-committed via quorum_core into tip_lane so the tip-stale set is itself a quorum-committed canonical entry.",
+      "aspects": []
+    },
+    {
+      "id": "probationary_set",
+      "node_type": "StateSet",
+      "definition": "The set of (chain, fork_id) candidates currently below the N-region admission threshold, materialized from CAS-committed observation entries in tip_lane. Each entry carries observed-region-set and first-observation hlc_stamp; entries are evicted when the candidate is admitted (committed as a tracked tip-fork pair) or when the operator-override admits over threshold-shortfall. Stale probationary entries beyond max-probationary-window are surfaced as alerts but remain in the set until explicitly resolved.",
+      "aspects": []
+    },
+    {
+      "id": "quarantined_source_set",
+      "node_type": "StateSet",
+      "definition": "The set of chain_router source replica identities currently quarantined, materialized from CAS-committed quarantine entries in tip_lane. Includes single-source rate-violation quarantines and set-level cross-source correlation quarantines. Reads of this set by tip_computer exclude quarantined-source votes from canonical-tip quorum.",
+      "aspects": []
+    },
+    {
+      "id": "tip_stale_set",
+      "node_type": "StateSet",
+      "definition": "The set of regional chain pools currently in tip-stale state, materialized from CAS-committed tip-stale-transition entries in tip_lane. Each entry carries the regional pool identity, the freshness-measure that triggered the transition, and an optional drain/pause attribution from control_lane so consumers can distinguish legitimate-stale from anomaly-stale.",
+      "aspects": []
+    },
+    {
+      "id": "canonical_tip_record",
+      "node_type": "StateSet",
+      "definition": "The current canonical-tip record per (chain, fork) pair, materialized from CAS-committed canonical-tip entries in tip_lane. Each entry carries the chain coordinates, contributing-region-set, hlc_stamp at commit, and (when present) the rollback notification atomically committed alongside it.",
+      "aspects": []
+    }
+  ],
+  "edges": [
+    [
+      "observation_intake",
+      "fork_admission",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "fork_admission",
+      "tip_computer",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "tip_computer",
+      "rollback_emitter",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "tip_stale_tracker",
+      "tip_computer",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "observation_intake",
+      "quarantined_source_set",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "fork_admission",
+      "probationary_set",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "tip_computer",
+      "canonical_tip_record",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "rollback_emitter",
+      "canonical_tip_record",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "tip_stale_tracker",
+      "tip_stale_set",
+      {
+        "edge_type": "derives"
+      }
+    ],
+    [
+      "tip_computer",
+      "quarantined_source_set",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "tip_computer",
+      "tip_stale_set",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "tip_computer",
+      "canonical_tip_record",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "fork_admission",
+      "probationary_set",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "tip_stale_tracker",
+      "canonical_tip_record",
+      {
+        "edge_type": "reads_from"
+      }
+    ]
+  ],
+  "requirements": [
+    {
+      "id": "IR-per-fork-canonical-tip",
+      "targets": [
+        {
+          "Node": "tip_computer"
+        },
+        {
+          "Node": "canonical_tip_record"
+        }
+      ],
+      "description": "A single canonical-tip view per (chain, fork) is maintained by quorum across regional chain pools and reported as such; tenants subscribe to or query an explicit (chain, fork) pair.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-stale-pool-quorum-exclusion",
+      "targets": [
+        {
+          "Node": "tip_computer"
+        },
+        {
+          "Node": "tip_stale_set"
+        }
+      ],
+      "description": "Canonical-tip quorum excludes votes from any chain pool currently in tip-stale state, so a stalled regional pool cannot anchor the global canonical-tip view.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-rollback-coherent",
+      "targets": [
+        {
+          "Node": "rollback_emitter"
+        }
+      ],
+      "description": "Reorg rollback notifications are keyed on globally-meaningful chain coordinates so every region emits a coherent rollback regardless of when its local chain pool observed the reorg.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "SR1-tip-source-rate-limit",
+      "targets": [
+        {
+          "Node": "observation_intake"
+        }
+      ],
+      "description": "Per-source rate limit on chain_router head-observation submissions to tip_quorum; observations beyond rate are dropped with a metric and source flagged.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "SR1-fork-admission-threshold",
+      "targets": [
+        {
+          "Node": "fork_admission"
+        },
+        {
+          "Node": "probationary_set"
+        }
+      ],
+      "description": "A (chain, fork_id) candidate is admitted as a tracked pair only after N independent regional observations across a documented window; below threshold the fork_id is held in a probationary set and not committed to state_log.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "SR1-tip-source-quarantine",
+      "targets": [
+        {
+          "Node": "observation_intake"
+        },
+        {
+          "Node": "quarantined_source_set"
+        }
+      ],
+      "description": "tip_quorum quarantines chain_router replicas whose observation pattern violates per-source rate or cross-source-correlation rules; quarantines surface as alerts and are visible in the state_log so canonical-tip computation excludes the quarantined source.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "SR2-probationary-timeout",
+      "targets": [
+        {
+          "Node": "fork_admission"
+        }
+      ],
+      "description": "tip_quorum surfaces an alert when a probationary (chain, fork_id) candidate exceeds a documented max-probationary-window without reaching the N-region admission threshold; the alert lists the observed-region-set and the absent-region-set so operators can correlate against ongoing region-drain or rotation events.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "SR2-region-distinct-admission",
+      "targets": [
+        {
+          "Node": "fork_admission"
+        }
+      ],
+      "description": "tip_quorum's N independent observations for (chain, fork_id) admission must come from N distinct regions, not merely N distinct chain_router replicas; multiple replicas in the same region count once for the threshold so colluding replicas within a region cannot satisfy the threshold alone.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "SR2-set-level-correlation",
+      "targets": [
+        {
+          "Node": "fork_admission"
+        },
+        {
+          "Node": "observation_intake"
+        }
+      ],
+      "description": "tip_quorum's source-quarantine rules include set-level cross-source correlation: a (chain, fork_id) candidate witnessed only by sources in suspicious correlation (synchronized timing, identical observation deltas, no other regional witness) is held probationary even when no single source violates per-source rate; the correlated set is surfaced in alerts.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "SR3-per-region-aggregate-rate",
+      "targets": [
+        {
+          "Node": "observation_intake"
+        }
+      ],
+      "description": "observation_intake enforces a per-region aggregate-admission-rate ceiling (across all sources within that region) so identity-rotation flooding from a single region is bounded even when each ephemeral identity stays under per-source rate; the regional ceiling and the offending region are surfaced as alerts.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-rotating-identity-flood"
+      }
+    },
+    {
+      "id": "SR3-cert-age-floor-for-admission",
+      "targets": [
+        {
+          "Node": "fork_admission"
+        },
+        {
+          "Node": "observation_intake"
+        }
+      ],
+      "description": "fork_admission counts an identity's observations toward the N-region threshold only when the identity's cert age exceeds a documented cert-age-floor; observations from fresh-cert identities are accepted by observation_intake but excluded from threshold counting (and the admission-eligibility status is recorded with the observation).",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-rotating-identity-flood"
+      }
+    },
+    {
+      "id": "SR3-quarantine-set-cas-stamping",
+      "targets": [
+        {
+          "Node": "tip_computer"
+        },
+        {
+          "Node": "quarantined_source_set"
+        }
+      ],
+      "description": "tip_computer stamps each canonical-tip CAS proposal with the hlc_stamp at which it read quarantined_source_set; quorum_core rejects the commit if quarantined_source_set has changed since that hlc_stamp. On rejection tip_computer re-reads and recomputes.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-quarantine-divergence"
+      }
+    },
+    {
+      "id": "SR3-retroactive-quarantine-window",
+      "targets": [
+        {
+          "Node": "observation_intake"
+        },
+        {
+          "Node": "tip_computer"
+        },
+        {
+          "Node": "quarantined_source_set"
+        }
+      ],
+      "description": "When observation_intake quarantines a source it CAS-commits a quarantine-window marker carrying the hlc_stamp range over which the source's observations are retroactively excluded; tip_computer reads quarantine-window markers and excludes observations within those windows from canonical-tip quorum even if those observations were already admitted to tip_lane.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-quarantine-divergence"
+      }
+    },
+    {
+      "id": "SR3-probationary-window-eviction",
+      "targets": [
+        {
+          "Node": "fork_admission"
+        },
+        {
+          "Node": "probationary_set"
+        }
+      ],
+      "description": "fork_admission's max-probationary-window evicts probationary entries (in addition to alerting) when the window expires without reaching the N-region threshold; eviction is a CAS-committed probationary_set transition stamped with the alert id so operator audit links eviction to alert.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-probationary-orphan-leak"
+      }
+    },
+    {
+      "id": "SR3-probationary-capacity-bound",
+      "targets": [
+        {
+          "Node": "fork_admission"
+        },
+        {
+          "Node": "probationary_set"
+        }
+      ],
+      "description": "fork_admission enforces a documented probationary_set capacity bound; on overflow it applies oldest-first eviction (with alert) and refuses-and-flags new probationary candidates from regions already over-represented in the probationary_set.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-probationary-orphan-leak"
+      }
+    },
+    {
+      "id": "SR3-rollback-in-canonical-cas",
+      "targets": [
+        {
+          "Node": "tip_computer"
+        },
+        {
+          "Node": "rollback_emitter"
+        },
+        {
+          "Node": "canonical_tip_record"
+        }
+      ],
+      "description": "rollback_emitter constructs the rollback notification as part of tip_computer's canonical-tip CAS proposal, not as a separate post-hoc commit; the rollback and the new canonical-tip record commit atomically in a single CAS round-trip so consumers cannot observe a canonical tip without its corresponding rollback (and vice-versa).",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-rollback-emit-toctou"
+      }
+    },
+    {
+      "id": "SR3-tip-stale-two-signals",
+      "targets": [
+        {
+          "Node": "tip_stale_tracker"
+        },
+        {
+          "Node": "tip_stale_set"
+        }
+      ],
+      "description": "tip_stale_tracker requires both source-flag-rate AND hlc-observation-freshness to fall below threshold before transitioning a region to tip-stale; a single signal alone is insufficient.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-tip-stale-false-positive"
+      }
+    },
+    {
+      "id": "SR3-tip-stale-mass-cap",
+      "targets": [
+        {
+          "Node": "tip_stale_tracker"
+        },
+        {
+          "Node": "tip_stale_set"
+        }
+      ],
+      "description": "tip_stale_tracker enforces a max-concurrent-tip-stale-transitions cap within a documented window; transitions beyond the cap are deferred and surfaced as an alert listing the deferred regions and their freshness measures.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-tip-stale-false-positive"
+      }
+    },
+    {
+      "id": "SR3-tip-stale-quorum-floor-gate",
+      "targets": [
+        {
+          "Node": "tip_stale_tracker"
+        },
+        {
+          "Node": "tip_stale_set"
+        },
+        {
+          "Node": "canonical_tip_record"
+        }
+      ],
+      "description": "Before committing a tip-stale transition, tip_stale_tracker reads canonical_tip_record's contributing-region-set count and refuses the transition if it would push canonical-tip quorum below the documented safe threshold; refusal surfaces as an alert with the (chain, fork) pairs at risk.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-tip-stale-false-positive"
+      }
+    },
+    {
+      "id": "SR3-per-key-fair-scheduling",
+      "targets": [
+        {
+          "Node": "observation_intake"
+        }
+      ],
+      "description": "observation_intake partitions its processing pipeline by (chain, fork_id) hash with per-partition fair scheduling: each partition gets a documented minimum throughput share so hot keys cannot starve cold keys.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-hot-fork-starvation"
+      }
+    },
+    {
+      "id": "SR3-per-key-rate-ceiling",
+      "targets": [
+        {
+          "Node": "observation_intake"
+        }
+      ],
+      "description": "observation_intake enforces a per-(chain, fork_id) sustained-rate ceiling (per-chain-configurable) so a single hot fork cannot consume the entire intake pipeline; excess shed with metric and source flag.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-hot-fork-starvation"
+      }
+    },
+    {
+      "id": "SR3-tip-stale-hlc-freeze",
+      "targets": [
+        {
+          "Node": "tip_stale_tracker"
+        },
+        {
+          "Node": "tip_stale_set"
+        }
+      ],
+      "description": "tip_stale_tracker reads hlc_service's degraded-mode marker from control_lane and freezes the tip_stale_set during HLC-degraded mode: no new tip-stale transitions are committed and no existing entries are evicted until HLC heals; existing entries remain conservatively in place.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-clock-skew-freshness"
+      }
+    },
+    {
+      "id": "SR3-tip-computer-hlc-degraded-defer",
+      "targets": [
+        {
+          "Node": "tip_computer"
+        },
+        {
+          "Node": "canonical_tip_record"
+        }
+      ],
+      "description": "tip_computer suspends canonical-tip CAS commits that depend on per-region HLC freshness during hlc_service degraded mode and defers updates to a bounded buffer that replays after HLC heals; suspended state is documented and surfaced as an alert.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-clock-skew-freshness"
+      }
+    },
+    {
+      "id": "SR3-fork-admission-shard-batching",
+      "targets": [
+        {
+          "Node": "fork_admission"
+        },
+        {
+          "Node": "probationary_set"
+        }
+      ],
+      "description": "fork_admission batches probationary_set CAS commits per (chain, fork_id) shard and applies updates per-shard so independent shards do not contend on a single CAS line; per-shard batching is documented with bounded latency vs throughput tradeoff.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-pipeline-backpressure"
+      }
+    },
+    {
+      "id": "SR3-shard-aware-backpressure",
+      "targets": [
+        {
+          "Node": "observation_intake"
+        },
+        {
+          "Node": "fork_admission"
+        }
+      ],
+      "description": "observation_intake exposes per-shard backpressure signals to its rate limiter so a contended shard's key tightens its rate cap without affecting healthy shards; the per-shard cap is at most the global per-key cap and at least a documented minimum to avoid total starvation of legitimate updates.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-pipeline-backpressure"
+      }
+    },
+    {
+      "id": "SR3-override-mofn-quorum",
+      "targets": [
+        {
+          "Node": "fork_admission"
+        },
+        {
+          "Node": "canonical_tip_record"
+        }
+      ],
+      "description": "fork_admission requires operator-override admission CAS proposals to carry M-of-N operator quorum signatures (configurable threshold) rather than a single operator credential; the signing operators are recorded with the override commit and visible in subsequent reorg notifications and audit.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-operator-override-abuse"
+      }
+    },
+    {
+      "id": "SR3-override-strict-explanation",
+      "targets": [
+        {
+          "Node": "fork_admission"
+        }
+      ],
+      "description": "fork_admission's operator-override gate requires every absent region in absent-region-set to map to a current drain-in-progress or rotation-in-progress entry in control_lane; partial explanations are rejected and surfaced as an override-attempt alert listing the unexplained regions.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-operator-override-abuse"
+      }
+    },
+    {
+      "id": "SR3-override-rate-limit",
+      "targets": [
+        {
+          "Node": "fork_admission"
+        }
+      ],
+      "description": "fork_admission enforces a documented max-overrides-per-window rate limit on operator-override admissions; approaching the limit surfaces an alert; exceeding it rejects further overrides with a documented error code visible to the operator path.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-operator-override-abuse"
+      }
+    },
+    {
+      "id": "SR3-heal-batch-coalescing",
+      "targets": [
+        {
+          "Node": "observation_intake"
+        },
+        {
+          "Node": "tip_computer"
+        },
+        {
+          "Node": "rollback_emitter"
+        },
+        {
+          "Node": "canonical_tip_record"
+        }
+      ],
+      "description": "On heal-replay, observation_intake tags replay observations with a heal-batch marker; tip_computer processes the entire batch as a single canonical-tip recompute and emits a single coalesced rollback (if any) keyed on the deepest divergence found in the batch — mid-batch canonical CAS commits are suppressed.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-heal-replay-rollback-reorder"
+      }
+    },
+    {
+      "id": "SR3-tip-stale-set-cas-stamping",
+      "targets": [
+        {
+          "Node": "tip_computer"
+        },
+        {
+          "Node": "tip_stale_set"
+        }
+      ],
+      "description": "tip_computer's canonical-tip CAS proposals stamp the hlc_stamp at which it read tip_stale_set; quorum_core rejects the commit if tip_stale_set changed since that hlc_stamp; on rejection tip_computer re-reads and recomputes — preserving IR-stale-pool-quorum-exclusion at commit time, not just read time.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-tip-stale-set-toctou"
+      }
+    }
+  ],
+  "satisfactions": [
+    {
+      "requirement_id": "IR-per-fork-canonical-tip",
+      "explanation": "tip_computer reads admitted (chain, fork_id) candidates from canonical_tip_record (materialized via tip_lane) and computes per-(chain, fork) canonical tip by quorum across regional chain pools; CAS-commits via quorum_core into tip_lane."
+    },
+    {
+      "requirement_id": "IR-stale-pool-quorum-exclusion",
+      "explanation": "tip_computer reads tip_stale_set (derived by tip_stale_tracker, CAS-committed in tip_lane) and excludes tip-stale-pool votes from canonical-tip quorum."
+    },
+    {
+      "requirement_id": "IR-rollback-coherent",
+      "explanation": "rollback_emitter constructs rollback notifications keyed on globally-meaningful chain coordinates and CAS-commits them atomically alongside the new canonical-tip record (single CAS proposal carrying both)."
+    },
+    {
+      "requirement_id": "SR1-tip-source-rate-limit",
+      "explanation": "observation_intake validates the cert-bearing surface, tags submissions with source replica identity, and enforces per-source rate limits — excess submissions are dropped and the source is flagged."
+    },
+    {
+      "requirement_id": "SR1-fork-admission-threshold",
+      "explanation": "fork_admission maintains the probationary_set keyed by observed-region-set; admits a (chain, fork_id) candidate only after N independent regional observations within a documented window; below threshold remains in probationary_set and is not committed to tip_lane."
+    },
+    {
+      "requirement_id": "SR1-tip-source-quarantine",
+      "explanation": "observation_intake quarantines sources violating per-source rate or correlation rules and writes the quarantined_source_set as a CAS-committed entry in tip_lane; tip_computer reads this set and excludes quarantined-source votes from quorum."
+    },
+    {
+      "requirement_id": "SR2-probationary-timeout",
+      "explanation": "fork_admission surfaces an alert when a probationary candidate exceeds the documented max-probationary-window without reaching N regions, listing observed-region-set and absent-region-set."
+    },
+    {
+      "requirement_id": "SR2-region-distinct-admission",
+      "explanation": "fork_admission's threshold counts N distinct regions (not N distinct replicas); multiple replicas in the same region count once for the threshold."
+    },
+    {
+      "requirement_id": "SR2-set-level-correlation",
+      "explanation": "fork_admission applies a set-level cross-source correlation rule: candidates witnessed only by sources with synchronized timing/identical deltas/no other regional witness stay probationary, and observation_intake records the correlated set in alerts."
+    },
+    {
+      "requirement_id": "SR3-per-region-aggregate-rate",
+      "explanation": "observation_intake redefinition adds per-region aggregate-admission-rate ceiling on top of per-source rate; identity-rotation flooding from a single region is bounded; offending region surfaces as alert."
+    },
+    {
+      "requirement_id": "SR3-cert-age-floor-for-admission",
+      "explanation": "observation_intake records cert-age metadata per accepted observation and tags admission-eligibility=ineligible when cert age below cert-age-floor; fork_admission counts only eligible observations toward the N-region threshold (ineligible still contribute to set-level correlation)."
+    },
+    {
+      "requirement_id": "SR3-quarantine-set-cas-stamping",
+      "explanation": "tip_computer's canonical-tip CAS proposal stamps hlc_stamp of quarantined_source_set read; quorum_core rejects commit if quarantined_source_set has changed since; tip_computer re-reads and recomputes on rejection."
+    },
+    {
+      "requirement_id": "SR3-retroactive-quarantine-window",
+      "explanation": "observation_intake commits a quarantine-window marker carrying hlc_stamp range alongside each quarantine entry; tip_computer reads quarantine-window markers and excludes observations within those windows from canonical-tip quorum even if already in tip_lane."
+    },
+    {
+      "requirement_id": "SR3-probationary-window-eviction",
+      "explanation": "fork_admission's max-probationary-window evicts entries (in addition to alerting); eviction is a CAS-committed probationary_set transition stamped with the alert id."
+    },
+    {
+      "requirement_id": "SR3-probationary-capacity-bound",
+      "explanation": "fork_admission enforces per-shard probationary_set capacity bound; on overflow oldest-first eviction with alert; new candidates from over-represented regions in that shard refused-and-flagged."
+    },
+    {
+      "requirement_id": "SR3-rollback-in-canonical-cas",
+      "explanation": "rollback_emitter operates as in-proposal step within tip_computer's canonical-tip CAS pipeline; rollback notification and new canonical-tip record commit atomically in a single CAS proposal — no separate emitter round-trip race window."
+    },
+    {
+      "requirement_id": "SR3-tip-stale-two-signals",
+      "explanation": "tip_stale_tracker requires both source-flag-rate AND hlc-observation-freshness to fall below documented thresholds before transitioning a region to tip-stale; a single signal alone is insufficient."
+    },
+    {
+      "requirement_id": "SR3-tip-stale-mass-cap",
+      "explanation": "tip_stale_tracker enforces max-concurrent-tip-stale-transitions cap within a documented window; transitions beyond the cap deferred and an alert lists deferred regions and freshness measures."
+    },
+    {
+      "requirement_id": "SR3-tip-stale-quorum-floor-gate",
+      "explanation": "tip_stale_tracker reads canonical_tip_record's contributing-region-set count before committing a tip-stale transition; refuses transition (with alert) if it would push canonical-tip quorum below documented safe threshold."
+    },
+    {
+      "requirement_id": "SR3-per-key-fair-scheduling",
+      "explanation": "observation_intake partitions processing pipeline by (chain, fork_id) hash with per-partition fair scheduling; each partition gets a documented minimum throughput share preventing hot-key starvation."
+    },
+    {
+      "requirement_id": "SR3-per-key-rate-ceiling",
+      "explanation": "observation_intake enforces per-(chain, fork_id) sustained-rate ceiling (per-chain configurable); excess shed with metric and source flag so a single hot fork cannot consume the entire intake pipeline."
+    },
+    {
+      "requirement_id": "SR3-tip-stale-hlc-freeze",
+      "explanation": "tip_stale_tracker reads hlc_service's degraded-mode marker from control_lane and freezes the tip_stale_set during HLC-degraded mode: no new transitions committed, no existing entries evicted until HLC heals; existing entries remain conservatively."
+    },
+    {
+      "requirement_id": "SR3-tip-computer-hlc-degraded-defer",
+      "explanation": "tip_computer suspends canonical-tip CAS commits that depend on per-region HLC freshness during hlc_service degraded mode; defers updates to a bounded buffer that replays after HLC heals; suspended state surfaces as alert."
+    },
+    {
+      "requirement_id": "SR3-fork-admission-shard-batching",
+      "explanation": "fork_admission batches probationary_set CAS commits per (chain, fork_id) shard and applies updates per-shard so independent shards do not contend on a single CAS line; per-shard batching documented with bounded latency vs throughput tradeoff."
+    },
+    {
+      "requirement_id": "SR3-shard-aware-backpressure",
+      "explanation": "observation_intake exposes per-shard backpressure signals from fork_admission to its rate limiter; contended shard's key tightens its rate cap (bounded by per-shard minimum) without affecting healthy shards."
+    },
+    {
+      "requirement_id": "SR3-override-mofn-quorum",
+      "explanation": "fork_admission requires operator-override admission CAS proposals to carry M-of-N operator quorum signatures (configurable threshold); signing operator identities recorded with the override commit, visible in reorg notifications and audit."
+    },
+    {
+      "requirement_id": "SR3-override-strict-explanation",
+      "explanation": "fork_admission's operator-override gate requires every absent region in absent-region-set to map to a current drain-in-progress or rotation-in-progress entry in control_lane; partial explanations rejected and unexplained regions surface as override-attempt alert."
+    },
+    {
+      "requirement_id": "SR3-override-rate-limit",
+      "explanation": "fork_admission enforces documented max-overrides-per-window rate limit; approaching surfaces an alert, exceeding rejects with a documented error code."
+    },
+    {
+      "requirement_id": "SR3-heal-batch-coalescing",
+      "explanation": "observation_intake tags heal-replay observations with heal-batch markers; tip_computer recognizes them and processes the entire batch as a single canonical-tip recompute, suppressing mid-batch CAS commits and emitting a single coalesced rollback keyed on the deepest divergence."
+    },
+    {
+      "requirement_id": "SR3-tip-stale-set-cas-stamping",
+      "explanation": "tip_computer's canonical-tip CAS proposal stamps hlc_stamp of tip_stale_set read; quorum_core rejects the commit if tip_stale_set has changed since; tip_computer re-reads and recomputes — IR-stale-pool-quorum-exclusion preserved at commit time."
+    }
+  ]
+}

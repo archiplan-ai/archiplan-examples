@@ -1,0 +1,361 @@
+{
+  "node_types": [
+    {
+      "name": "Service",
+      "definition": "A deployable runtime component that handles requests, performs work, or coordinates other components",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "Store",
+      "definition": "A persistent data store that holds state across requests and process lifetimes",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "ChainNode",
+      "definition": "An external blockchain full or archive node that exposes the chain's native protocol (JSON-RPC, chain-sync, etc.) and is the source of truth for that chain's data",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "Client",
+      "definition": "An external API consumer (developer's application) that calls the gateway over HTTP or WebSocket",
+      "layer": "epistatic",
+      "aspects": []
+    }
+  ],
+  "edge_types": [
+    {
+      "name": "proxies_to",
+      "layer": "epistatic",
+      "from_types": [
+        "Service"
+      ],
+      "to_types": [
+        "ChainNode"
+      ]
+    },
+    {
+      "name": "reads_from",
+      "layer": "epistatic",
+      "from_types": [
+        "Service"
+      ],
+      "to_types": [
+        "Store"
+      ]
+    },
+    {
+      "name": "writes_to",
+      "layer": "epistatic",
+      "from_types": [
+        "Service"
+      ],
+      "to_types": [
+        "Store"
+      ]
+    },
+    {
+      "name": "connects_to",
+      "layer": "epistatic",
+      "from_types": [
+        "Client"
+      ],
+      "to_types": [
+        "Service"
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "gateway",
+      "node_type": "Service",
+      "definition": "Single public entry point: terminates HTTP and WebSocket traffic, authenticates API keys, enforces per-key rate limits and quotas, proxies JSON-RPC requests to the appropriate chain node, and fans out chain events to subscribed clients",
+      "aspects": []
+    },
+    {
+      "id": "eth_archive",
+      "node_type": "ChainNode",
+      "definition": "Ethereum mainnet archive node (e.g., Erigon or Geth in archive mode) holding full historical state and exposing JSON-RPC plus WebSocket subscriptions",
+      "aspects": []
+    },
+    {
+      "id": "sepolia_archive",
+      "node_type": "ChainNode",
+      "definition": "Sepolia testnet archive node holding full historical Sepolia state and exposing the same JSON-RPC and subscription interface as eth_archive",
+      "aspects": []
+    },
+    {
+      "id": "btc_archive",
+      "node_type": "ChainNode",
+      "definition": "Bitcoin Core full node with txindex enabled, providing historical block and transaction data plus ZMQ/REST notifications for new blocks and mempool activity",
+      "aspects": []
+    },
+    {
+      "id": "ada_archive",
+      "node_type": "ChainNode",
+      "definition": "Cardano node paired with an Ogmios bridge, providing chain-sync (historical blocks), local-state-query (UTxO/protocol state), and local-tx-monitor (mempool) over a JSON interface",
+      "aspects": []
+    },
+    {
+      "id": "tenant_store",
+      "node_type": "Store",
+      "definition": "Persistent store of tenants, API keys, plan tiers, and rate-limit/quota counters; consulted on every authenticated request",
+      "aspects": []
+    },
+    {
+      "id": "client",
+      "node_type": "Client",
+      "definition": "External developer application that connects to the gateway over HTTP for request/response RPC and over WebSocket for real-time subscriptions",
+      "aspects": []
+    }
+  ],
+  "edges": [
+    [
+      "client",
+      "gateway",
+      {
+        "edge_type": "connects_to"
+      }
+    ],
+    [
+      "gateway",
+      "eth_archive",
+      {
+        "edge_type": "proxies_to"
+      }
+    ],
+    [
+      "gateway",
+      "sepolia_archive",
+      {
+        "edge_type": "proxies_to"
+      }
+    ],
+    [
+      "gateway",
+      "btc_archive",
+      {
+        "edge_type": "proxies_to"
+      }
+    ],
+    [
+      "gateway",
+      "ada_archive",
+      {
+        "edge_type": "proxies_to"
+      }
+    ],
+    [
+      "gateway",
+      "tenant_store",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "gateway",
+      "tenant_store",
+      {
+        "edge_type": "writes_to"
+      }
+    ]
+  ],
+  "requirements": [
+    {
+      "id": "R-eth",
+      "targets": [
+        {
+          "Node": "eth_archive"
+        }
+      ],
+      "description": "System exposes Ethereum mainnet on-chain data (current and historical) to authenticated clients via the chain's native JSON-RPC interface",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-sepolia",
+      "targets": [
+        {
+          "Node": "sepolia_archive"
+        }
+      ],
+      "description": "System exposes Sepolia testnet on-chain data (current and historical) to authenticated clients via the chain's native JSON-RPC interface",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-btc",
+      "targets": [
+        {
+          "Node": "btc_archive"
+        }
+      ],
+      "description": "System exposes Bitcoin on-chain data (current and historical) to authenticated clients via the chain's native JSON-RPC interface",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-ada",
+      "targets": [
+        {
+          "Node": "ada_archive"
+        }
+      ],
+      "description": "System exposes Cardano on-chain data (current and historical) to authenticated clients via the chain's native interface (Ogmios mini-protocols)",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-historical",
+      "targets": [
+        {
+          "Node": "gateway"
+        }
+      ],
+      "description": "Clients can query state at any historical block on every supported chain (archive semantics, not just recent state)",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-realtime-newheads",
+      "targets": [
+        {
+          "Node": "gateway"
+        }
+      ],
+      "description": "Clients can subscribe over WebSocket and receive every new block header as it is observed by the corresponding chain node",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-realtime-mempool",
+      "targets": [
+        {
+          "Node": "gateway"
+        }
+      ],
+      "description": "Clients can subscribe over WebSocket and receive pending/unconfirmed transactions, including Cardano via the Ogmios local-tx-monitor mini-protocol",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-realtime-address",
+      "targets": [
+        {
+          "Node": "gateway"
+        }
+      ],
+      "description": "Clients can subscribe over WebSocket to a watched address and receive an event whenever that address sends or receives value on the corresponding chain",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-multitenant",
+      "targets": [
+        {
+          "Node": "gateway"
+        }
+      ],
+      "description": "Every request and subscription is authenticated to a specific tenant via an API key looked up in the tenant store",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-ratelimit",
+      "targets": [
+        {
+          "Node": "gateway"
+        }
+      ],
+      "description": "Per-API-key request-rate limits and usage quotas are enforced before the request reaches a chain node",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-passthrough",
+      "targets": [
+        {
+          "Node": "gateway"
+        }
+      ],
+      "description": "Each chain's native JSON-RPC / mini-protocol surface is exposed to clients without translation to a unified cross-chain schema",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "R-reorg-safe",
+      "targets": [
+        {
+          "Node": "gateway"
+        }
+      ],
+      "description": "The system delivers reorg-safe semantics: WebSocket subscribers receive explicit rollback notifications, and REST/RPC responses can express finality status",
+      "origin": {
+        "type": "Initial"
+      }
+    }
+  ],
+  "satisfactions": [
+    {
+      "requirement_id": "R-eth",
+      "explanation": "eth_archive is an Ethereum mainnet archive node serving the chain's native JSON-RPC; the gateway proxies authenticated requests to it"
+    },
+    {
+      "requirement_id": "R-sepolia",
+      "explanation": "sepolia_archive is a Sepolia testnet archive node serving the chain's native JSON-RPC; the gateway proxies authenticated requests to it"
+    },
+    {
+      "requirement_id": "R-btc",
+      "explanation": "btc_archive is a Bitcoin Core full node with txindex; the gateway proxies authenticated requests to its JSON-RPC and notification interface"
+    },
+    {
+      "requirement_id": "R-ada",
+      "explanation": "ada_archive is a Cardano node + Ogmios bridge exposing chain-sync, local-state-query, and local-tx-monitor; the gateway proxies authenticated requests to it"
+    },
+    {
+      "requirement_id": "R-historical",
+      "explanation": "All four chain nodes are configured in archive mode (or with full history), so historical state at any block is reachable through their native interfaces"
+    },
+    {
+      "requirement_id": "R-realtime-newheads",
+      "explanation": "The gateway opens a long-lived chain-sync / newHeads subscription against each chain node and forwards new headers to subscribed websocket clients"
+    },
+    {
+      "requirement_id": "R-realtime-mempool",
+      "explanation": "The gateway subscribes to each chain node's pending-transaction stream (eth newPendingTransactions, btc ZMQ rawmempool, ada Ogmios local-tx-monitor) and forwards pending txs to subscribed clients"
+    },
+    {
+      "requirement_id": "R-realtime-address",
+      "explanation": "The gateway evaluates each new block and pending-tx event against client-supplied address filters and pushes a match event to the relevant subscribers"
+    },
+    {
+      "requirement_id": "R-multitenant",
+      "explanation": "The gateway resolves the API key on every connection/request against tenant_store and tags the session with the tenant identity"
+    },
+    {
+      "requirement_id": "R-ratelimit",
+      "explanation": "The gateway updates per-key rate-limit and quota counters in tenant_store on each request and rejects requests that exceed the tenant's configured limits"
+    },
+    {
+      "requirement_id": "R-passthrough",
+      "explanation": "The gateway forwards JSON-RPC method calls verbatim per chain (eth_*, btc getblock/getrawtransaction/etc., Ogmios mini-protocols) without rewriting them into a common schema"
+    },
+    {
+      "requirement_id": "R-reorg-safe",
+      "explanation": "The gateway tracks rollback events emitted by each chain node's chain-sync/newHeads stream and forwards them as explicit rollback messages on the matching websocket subscriptions; REST responses include the chain head's finality at request time"
+    }
+  ]
+}

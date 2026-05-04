@@ -1,0 +1,2008 @@
+{
+  "node_types": [
+    {
+      "name": "Subservice",
+      "definition": "Internal control-plane subservice running as part of the region_coordinator quorum across regions. Holds no canonical state outside the consensus substrate; mutations are proposed via quorum_core, reads come from state_log.",
+      "layer": "epistatic",
+      "aspects": []
+    },
+    {
+      "name": "Log",
+      "definition": "Replicated, quorum-committed append log holding canonical region_coordinator state. Writes are durable only after quorum acknowledgement; locally-applied views are read by every subservice that needs canonical state.",
+      "layer": "epistatic",
+      "aspects": []
+    }
+  ],
+  "edge_types": [
+    {
+      "name": "calls",
+      "layer": "epistatic",
+      "from_types": [
+        "Subservice"
+      ],
+      "to_types": [
+        "Subservice"
+      ]
+    },
+    {
+      "name": "writes_to",
+      "layer": "epistatic",
+      "from_types": [
+        "Subservice"
+      ],
+      "to_types": [
+        "Log"
+      ]
+    },
+    {
+      "name": "reads_from",
+      "layer": "epistatic",
+      "from_types": [
+        "Subservice"
+      ],
+      "to_types": [
+        "Log"
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "quorum_core",
+      "node_type": "Subservice",
+      "definition": "Consensus engine (Raft/multi-Paxos style) deployed as a quorum across regions; provides the not-itself-a-SPOF property of region_coordinator. Maintains separate write-class lanes (tombstone_lane, tip_lane, aggregate_lane, control_lane) each with reserved consensus throughput and a documented per-class SLO so head-of-line blocking is contained within a lane. Proposals are CAS: callers attach a precondition payload (latest-applied lane heads, or named state-snapshot keys); commit succeeds only if preconditions still hold at commit time. CAS rejection on precondition-violation and CAS rejection on leader-change are returned as distinct error codes — proposers (lifecycle_gate, quota_aggregator, tip_quorum, residency_publisher, flag_propagator, offboarding_orchestrator) apply exponential backoff with jitter on either, and treat leader-change as transient rather than immediately re-proposing with stale preconditions. quorum_core enforces a per-proposer in-flight CAS budget and a global CAS admission rate so a thrashing proposer cannot saturate consensus throughput; over-budget proposals are rejected fast with a retryable-with-backoff signal. Entries are tagged with schema_version; admission of a new schema_version is itself a quorum-committed capability config entry into control_lane — leaders restrict writes to the previous schema_version until that config commits. Every lane entry carries an HLC stamp captured at write time; quorum_core validates the stamp at commit time and rejects entries whose stamp is missing or beyond max-allowed-delta from the current HLC, so lane consumers can rely on stamps for cross-lane happens-before reconstruction. While the leader's hlc_service is in skew-degraded mode, quorum_core suspends admission of entry kinds that participate in security-critical cross-lane happens-before reconstruction (revocation-then-attestation, erasure-tombstone-then-offboarding-attestation, fast-path flag-applied attestations); other admissions carry an HLC-degraded annotation visible to consumers. Snapshot+truncate at watermark intervals: replicas catch up via snapshot transfer plus log-tail rather than full-log replay. Snapshot install on a replica is atomic via an intent-then-commit protocol: the replica writes a snapshot-installing intent marker before any state mutation, replaces state files, then writes a snapshot-commit marker; on restart, an intent without matching commit forces full discard of partial snapshot state and re-fetch from quorum. A replica with an in-progress or failed snapshot install enters a NEEDS_SNAPSHOT state visible to the quorum: it does not vote, does not serve reads (including partition-stale reads), and does not count toward the quorum-size threshold until snapshot install commits and log-tail catch-up completes. On network partition, minority-region quorum_core replicas reject proposals fast with a retryable-on-quorum-region signal and serve reads from locally-applied lane state with a partition-stale freshness annotation; bounded-watermark input buffers absorb non-discardable inputs (with overflow policy: drop-with-loss-attestation for low-severity, alert-escalation for high-severity); on heal, buffered work is replayed via quorum_core with idempotency keys so duplicates land but only commit once. Inter-region channel is a cert-bearing surface (parent R-cert-inventory).",
+      "aspects": []
+    },
+    {
+      "id": "offboarding_orchestrator",
+      "node_type": "Subservice",
+      "definition": "Driven by erasure-tombstone entries in tombstone_lane. Originates per-component offboarding signals to downstream parent components (gateway, fanout, address_index, chain_router, usage_meter) in a documented order; signals are signed by lifecycle_gate's signing authority (carrying the broadcast's named roster_version) and rejected by parent components if they lack a current valid signature. Each signal carries an idempotency key (offboarding_id, component_id, attempt_id) committed via quorum_core into tombstone_lane so the canonical signal record survives leader change. Downstream components return the same attestation for the same key (cached) and dedupe by idempotency key. Maintains a durable per-(offboarding_id, component_id) apply-state phase marker on control_lane that progresses through RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL; the orchestrator never retracts a drain-ack already emitted for that key, and a missing intermediate phase implies the component owes a re-emit not a retraction. Each component has a documented attestation SLO; on timeout, offboarding_orchestrator records a best-effort attestation with evidence and escalation owner instead of waiting indefinitely. Tracks per-downstream-component best-effort-attestation rate; crossing a documented breaker threshold opens a component-outage state for that component: new offboarding signals are suspended, a component-outage alert is raised, and erasure tombstones whose data class would touch that component are held in queued-pending-component-recovery state in tombstone_lane. The breaker closes when the component's attestation SLO is again being met for a documented recovery window, and queued-pending entries drain via the normal offboarding flow. Bulk-offboarding waves are admitted from lifecycle_gate's bounded-batching pipeline with documented max-tenants-per-wave and inter-wave spacing; offboarding_orchestrator consumes from the per-writer back-pressure-aware queue and stalls further wave admission for that writer rather than dropping broadcasts or expiring HLC windows; per-tenant HLC-bounded ack windows start from per-tenant ack-broadcast-emit-HLC. Drain-fence-coordinator role within the protocol: for each drain-fence broadcast(T, f_T, signing roster_version) issued by lifecycle_gate, offboarding_orchestrator tracks per-(T, named-writer) ack state, surfaces unacked writers into the certificate-of-deletion exception register, and ensures the writer's flush-then-ack-then-teardown ordering by consulting lifecycle_gate's teardown-admission interlock: a writer's node-teardown is not admitted while any in-flight per-tenant drain-fence on that node is unacked. If a writer's remaining teardown window cannot accommodate the flush, offboarding_orchestrator records a durable drain-ack-handoff entry naming the successor instance or persistent buffer that owns the residual writes; ack-by-handoff is treated as ack for the certificate-of-deletion. The aggregate certificate of deletion is issued in 'complete-with-exceptions' state when every component has either timely attestation or recorded best-effort attestation with evidence; exceptions are tracked in a separate exception register on control_lane with their own SLA on resolution. Where a preservation hold (parent R-preservation-hold) covers a data class that erasure would touch, the affected component returns 'preservation-blocked' attestation with the hold reference — a recognized terminal state. Incoming attestations dedupe by idempotency key before aggregating into the certificate of deletion. Once a writer ack reaches FLUSH-COMPLETE on its phase marker, offboarding_orchestrator updates control_lane atomically; observed_ack_hlc for the slowest writer is consumed by lifecycle_gate's PHASE B audit-key destruction t_destroy computation. (Realizes IR-offboarding-teardown and the stalled-offboarding / attestation-replay derivations; integrates Session 5 drain-fence pipeline contracts r-s5-drain-fence-protocol, r-s5-drain-fence-bounded-batching, r-s5-drain-fence-teardown-overlap, and the per-(offboarding_id, component_id) durable phase marker contract with no-retract semantics.)",
+      "aspects": []
+    },
+    {
+      "id": "quota_aggregator",
+      "node_type": "Subservice",
+      "definition": "Receives sub-second per-(tenant, plan_version, tenant_cluster) usage deltas from every region's usage_meter. Bucketed by HLC time via hlc_service, not wall-clock. Pre-aggregates incoming deltas in-memory by (tenant, plan_version, tenant_cluster, HLC bucket) before proposing to aggregate_lane, so consensus throughput on aggregate_lane scales with bucket count rather than raw delta arrival rate. Maintains rolling aggregates committed via quorum_core into aggregate_lane. Reads aggregate_lane (own state), tombstone_lane (cluster suspensions to factor into ceiling computation), control_lane (in-force plan_version, residency policy). When the pre-aggregation buffer exceeds a documented watermark, sheds by ceiling-proximity class: aggregates well under the per-plan ceiling are dropped first with a loss-attestation; aggregates near or crossing a ceiling retain admission priority into aggregate_lane so throttle-flag tombstones are not delayed by low-severity delta floods. Crossing a per-plan ceiling or per-cluster quota proposes a throttle-flag tombstone via quorum_core into tombstone_lane. On partition, minority-region quota_aggregator buffers incoming deltas under a bounded watermark (overflow: alert-escalation for any aggregate that would exceed a ceiling, drop-with-loss-attestation otherwise); on heal, buffered deltas replay with idempotency keys. (Realizes IR-quota-aggregation; lane-aware.)",
+      "aspects": []
+    },
+    {
+      "id": "flag_propagator",
+      "node_type": "Subservice",
+      "definition": "Watches tombstone_lane for committed flags (throttle, plan-change, cluster-suspended, key-revocation, preservation-hold, erasure-tombstone) and writes them to every region's auth_cache (parent) via the unified fast-path. The fast-path has a documented per-region delivery SLO monitored independently of bulk propagation rate; SLO breach raises an alert. For high-severity flags (cluster-suspended, key-revocation, erasure-tombstone), publishes a deny-during-propagation pending-marker to every region's auth_cache before the per-region apply lands so the flag-affected identity cannot serve traffic in the propagation window. Pending-markers carry an originating-proposal-id and an HLC expiry bound; flag_propagator rejects any pending-marker publication that is not tied to an in-flight or committed tombstone proposal in tombstone_lane, and enforces a per-target_identity rate limit on pending-marker publication. Pending-markers beyond the rate are dropped with a metric and the originating proposer is flagged; the per-target_identity rate limit is independent of the unified fast-path's per-region delivery SLO so DoS attempts via pending-markers cannot also starve legitimate flag delivery. On HLC expiry the marker auto-clears in auth_cache without explicit retraction, so a stalled or rejected proposal cannot indefinitely deny traffic. Per-region apply produces a flag-applied attestation written back through quorum_core into control_lane; a flag is globally-active only after attestations from every region land. Lagging regions surface as alerts. (Realizes IR-flag-fast-path and the cluster-suspension-race derivations.)",
+      "aspects": []
+    },
+    {
+      "id": "tip_quorum",
+      "node_type": "Subservice",
+      "definition": "Receives head observations from each region's chain_router (parent), authenticated via the cert-bearing surface and tagged with source replica identity. Per-source rate limits drop excess submissions and flag the source. (chain, fork_id) candidate admission requires N independent observations across N distinct regions (not merely N distinct chain_router replicas in the same region); multiple replicas in the same region count once for the threshold so colluding replicas within a region cannot satisfy the threshold alone. Below threshold the candidate is held in a probationary set. A probationary (chain, fork_id) candidate that exceeds a documented max-probationary-window without reaching the N-region threshold surfaces an alert listing the observed-region-set and the absent-region-set so operators can correlate against ongoing region-drain or rotation events. An operator-override admission path exists via lifecycle_gate: tip_quorum does not itself validate operator credentials and does not implement a parallel credential check — it accepts override admissions only when delivered through lifecycle_gate's CAS path, which is the single enforcement point for region_coordinator's operator-credential authorization model (M-of-N signatures from distinct registered operator credentials drawn from the published roster, compromise-revocation invalidates in-flight overrides, per-operator audit trail). tip_quorum's local M-of-N gating semantics over override admission therefore delegate credential validation to lifecycle_gate: it consumes the admitted override entry from tip_lane (or its lifecycle_gate-published precondition record on control_lane), trusts the credential check as having been enforced at admission, and applies the override to the probationary set with the operator-attribution payload preserved end-to-end into subsequent reorg notifications. Any override-shaped proposal that did not transit lifecycle_gate's admission contract is rejected. Computes the canonical tip per (chain, fork) by quorum across regional chain pools, excluding votes from pools currently in tip-stale state (read from tip_lane and control_lane). Detects reorgs and emits coherent rollback notifications keyed on chain coordinates committed via quorum_core into tip_lane. Source-quarantine rules include set-level cross-source correlation: a (chain, fork_id) candidate witnessed only by sources in suspicious correlation (synchronized timing, identical observation deltas, no other regional witness) is held probationary even when no single source violates per-source rate, and the correlated set is surfaced in alerts. Quarantines surface as alerts and exclude the quarantined source from quorum. On partition, minority-region tip_quorum buffers observations under a bounded watermark; on heal, observations replay with idempotency keys. (Realizes IR-per-fork-canonical-tip, IR-stale-pool-quorum-exclusion, IR-rollback-coherent and the tip-flood derivations; defers operator-credential validation on override admission to lifecycle_gate per bubble-tip_quorum-1.)",
+      "aspects": []
+    },
+    {
+      "id": "residency_publisher",
+      "node_type": "Subservice",
+      "definition": "Owns each tenant's residency policy with explicit version + effective-from HLC stamp. Resolves policy from tenant_store (parent), commits new versions via quorum_core into control_lane, and pushes new versions to every consumer (edge, gateway, usage_meter, metrics_store at parent scope). Tightening changes (narrowing allowed regions) are a 2PC at zoom: (PREPARE) residency_publisher commits a prepared-V+1 entry to control_lane bound to a per-tenant quarantine-and-relocate-complete-ack precondition; tenant_store performs the quarantine-and-relocate and emits an HLC-stamped prepared-ack via its parent-scope writes-to-region_coordinator path; residency_publisher writes the prepared-ack record to control_lane. Without prepared-ack, residency_publisher MUST NOT proceed. (COMMIT) M-of-regions quorum-witnessed CAS activates V+1: residency_publisher proposes activate-V+1 via quorum_core; commit re-validates the precondition that tenant_store's prepared-ack is still observable AND that the per-region push-and-acknowledge ack quorum is met; on commit, residency_publisher broadcasts V+1 active to all consumers via a push-and-acknowledge channel. Activation is globally-ordered via HLC. (ABORT) On prepared-window expiry without commit (HLC-bounded), residency_publisher CAS-commits an abort-V+1 entry under (tenant_key, V+1, attempt_id) idempotency: same abort_id twice is a no-op; strictly newer attempt_id starts fresh from V's current state; tenant_store's relocate-and-rollback is idempotent on the same key tuple. tenant_store's V+1-prepared state has an HLC-bounded prepared-window; on window expiry without commit, tenant_store enters PREPARED-ORPHAN degraded mode visible via parent-scope alarms — refuses further V+1 prepares for that tenant_key, recovery requires explicit operator action under M-of-N. ack-tracking is monotonic per (consumer, V): once a consumer has missed the activation window it falls deny-by-default for V regardless of subsequently-arriving acks; consumer must ack-ready a strictly newer V to leave deny-by-default. Pre-warm hydration channel: on consumer cold-start (process restart, scale-out, region failover, or a new instance_id registering), the consumer requests a pre-warm-hydration delivering the currently-active policy_version's full state synchronously; the consumer ack-readies the active version inline as part of registration and only after ack-readying does it begin serving residency-pinned traffic. Pre-warm requests are rate-limited per-region by residency_publisher to bound load under correlated cold-start events (e.g. region failover): documented per-region RPS cap; over-cap requesters are queued with bounded queue depth; queue-overflow returns a pre-warm-deferred signal causing the consumer to fall to deny-by-default for residency-pinned operations. Pre-warm honors monotonic-per-(consumer, instance_id, version) — a fresh instance_id starts a fresh ack history; the same instance_id cannot regress. If pre-warm cannot complete within a documented freshness budget, the consumer falls to deny-by-default for residency-pinned operations and reports pre-warm-stalled; out-of-band signals are not a valid activation source. Activation, prepared-ack, abort, prepared-orphan, and pre-warm-stalled events all write typed entries to compliance_audit (parent) via compliance_audit_owner's schema. Activation and rotation-style state changes are credentialed-ops: residency_publisher's CAS proposals carry the active roster_version captured from control_lane and are CAS-rejected if the roster_version is not at-or-above the consumer-acked roster_version at commit-HLC. (Realizes inherited r-s5-residency-2pc-prepare-fence, r-s5-residency-2pc-prepared-orphan, r-s5-residency-2pc-abort-idempotency, r-s5-policy-ack-prewarm, r-s4-policy-ack-thrash, r-s4-policy-version-partition-skew; supersedes prior naive two-phase apply.)",
+      "aspects": []
+    },
+    {
+      "id": "hlc_service",
+      "node_type": "Subservice",
+      "definition": "Distributes a hybrid-logical clock to subscribers (gateway, fanout, region_coordinator subservices) for time-bucketed enforcement and ordering. Cross-region samples are exchanged out-of-band over the cert-bearing inter-region channel — not via consensus (HLC samples do not enter the lanes; consensus needs HLC, so the dependency cannot be inverted). Samples beyond a documented max-allowed-delta from the local HLC are discarded and the source is flagged but does not advance the local clock. Local HLC is computed from a multi-peer median (N >= 3 peer samples). hlc_service consults control_lane for pause-in-progress entries scoped to its region; while a pause-in-progress entry covers its region, sample-vs-median delta is evaluated against a wider pause-mode bound and the region does not auto-trip skew-degraded mode for delta excursions explainable by the pause. On pause-end, hlc_service re-syncs from multi-peer median and only then resumes normal max-allowed-delta enforcement, so legitimate operational pauses (VM live migration and successor pause classes) do not cascade into avoidable skew-degraded windows. A region whose hlc_service cannot agree with multi-peer median within max-allowed-delta for a documented window outside any covering pause is automatically forced into the parent-defined skew-degraded mode and stops accepting writes that depend on time-bucketed enforcement. (Realizes IR-hlc-distribution and the hlc-poisoning derivations.)",
+      "aspects": []
+    },
+    {
+      "id": "lifecycle_gate",
+      "node_type": "Subservice",
+      "definition": "Single scheduler-of-record for cross-component lifecycle operations against shared targets, scheduling and gating lifecycle events globally via CAS proposals through quorum_core into control_lane: cert/origin rotations (region-staggered), chain pool rotations (one pool, one region, one wave at a time, admitted only while canonical-tip quorum size remains above its safe threshold), region-drain events (first-class lifecycle event), schema-version capability bumps (two-phase: deploy then activate), documented operational pauses (VM live migration etc), residency-policy activation windows (residency_publisher's 2PC commit window admitted via lifecycle_gate), credential_roster rotation activation windows (admitted via lifecycle_gate), and operator-override probationary-fork admissions. Cert rotations on the inter-region channel are admitted only when remaining validity exceeds a documented overlap budget; if breached, lifecycle_gate raises emergency-cert-recovery in control_lane and stops admitting any non-cert-rotation lifecycle events; recovery from total cert expiry is delegated to cert_bootstrap. CAS proposals attach the latest read of (per-(chain, fork) quorum-size set, rotation-in-progress set, tip-stale set, schema-capability config, drain-in-progress set, pause-in-progress set, current roster_version, compromise-revoked credential set, lease-issuance state, residency policy_version, prepared-ack set) as the precondition; commit re-validates atomically. At most one region-drain plus one pool-rotation in flight globally. Tags rotation-in-progress, drain-in-progress, pause-in-progress in control_lane so chain_router (parent) suppresses quarantines and hlc_service applies pause-aware bounds. Operator-override admission delegates credential validation to credential_roster's published roster: every override CAS proposal must carry M-of-N signatures from M distinct registered operator credentials drawn from the active roster_version named in the CAS precondition; lifecycle_gate validates each signature against credential_roster's published state in control_lane and rejects fast on insufficient signers, on signers in compromise-revoked set, or on validity-window mismatch; admission record persists signing operator identities into control_lane. In-flight override proposals are invalidated on credential transitions into compromise-revoked between admission and commit (CAS rejection with credential-revoked-mid-flight reason). Drain-fence-broadcast originator (PHASE A of audit-key destruction): on observing an erasure-tombstone in tombstone_lane for tenant T, lifecycle_gate computes a fence_HLC f_T and broadcasts a drain-fence-broadcast(T, f_T, signing roster_version) to every named writer (region_coordinator subservices internally + parent-scope chain_router, gateway, fanout, address_index, usage_meter). Broadcasts carry the signing roster_version as part of the broadcast itself; consumers verify against the broadcast's NAMED roster_version rather than a cached version, so a signed broadcast remains verifiable across a roster rotation that activates a strictly newer roster_version mid-flight. On compromise-revocation events from credential_roster carrying a retroactive-as-of-HLC, lifecycle_gate re-signs and re-broadcasts in-flight drain-fence broadcasts whose emit-HLC is at or after retroactive-as-of-HLC, with fresh broadcast-emit-HLC and fresh per-tenant ack window; per-tenant ack windows start from per-tenant ack-broadcast-emit-HLC, not from the bulk operator action HLC. Bounded-batching for bulk-offboarding: lifecycle_gate admits bulk-offboarding requests into bounded waves with documented max-tenants-per-wave and inter-wave spacing such that per-wave ack fan-in stays within region_coordinator's documented ack-throughput target; each writer has a bounded ack queue; explicit back-pressure to lifecycle_gate stalls further wave admission for that writer rather than dropping broadcasts or expiring per-tenant HLC windows; bulk-offboarding admission is itself a CAS-committed operator-credentialed proposal and is audited via compliance_audit_owner. Teardown-overlap sequencing: a node-teardown is not admitted while any in-flight per-tenant drain-fence on that node is unacked; nodes that cannot flush within their teardown window write a durable drain-ack-handoff record to lease_lane (or tombstone_lane, schema-tagged) naming a successor instance or persistent buffer that owns the residual writes and ack-by-handoff; the handoff record is part of the certificate of deletion. Audit-key destruction PHASE B: lifecycle_gate computes earliest-permissible t_destroy = max(observed_ack_hlc, f_T + skew_bound) + write-delivery-grace (the bound published by compliance_audit_owner) and CAS-commits an audit-key DESTROYED entry to lease_lane at HLC >= t_destroy; the DESTROYED entry triggers compliance_audit_owner's late-write-rejection cutoff at compliance_audit (parent). PHASE B does not commit while any drain-ack for T is outstanding from a named writer (including drain-ack-handoff records that are still un-flushed). All lifecycle events, override admissions, drain-fence broadcasts, drain-acks, and audit-key DESTROYED writes are typed-audited via compliance_audit_owner's schema registry. (Realizes inherited r-s5-drain-fence-protocol, r-s5-drain-fence-bounded-batching, r-s5-drain-fence-teardown-overlap, r-s5-broadcast-self-contained-credential, r-s5-audit-key-destruction-fence; supersedes prior inlined roster validation by delegating to credential_roster.)",
+      "aspects": []
+    },
+    {
+      "id": "tombstone_lane",
+      "node_type": "Log",
+      "definition": "Latency-critical lane for small tombstoned flag entries: throttle, plan-change, cluster-suspended, key-revocation, preservation-hold, erasure-tombstone. Also carries queued-pending-component-recovery entries for erasure tombstones whose downstream component is in an open component-outage breaker state (offboarding_orchestrator); the queued-pending entries drain via the normal offboarding flow once the breaker closes, and the queue is itself audited and alerted if its depth exceeds a documented bound. Reserved consensus throughput with a documented end-to-end commit-latency SLO (the unified fast-path SLO). Tombstone history is retained in full through snapshots so revocation semantics survive compaction. Entries carry HLC stamps and schema_version tags.",
+      "aspects": []
+    },
+    {
+      "id": "tip_lane",
+      "node_type": "Log",
+      "definition": "Per-(chain, fork) canonical-tip view, tip-stale set, fork-candidate probationary set, and rollback notifications keyed on chain coordinates. High-frequency (one update per chain block per fork). Compaction retains only the latest committed tip per (chain, fork) plus a bounded reorg-window history; older history is dropped at snapshot. Carries HLC stamps and schema_version tags.",
+      "aspects": []
+    },
+    {
+      "id": "aggregate_lane",
+      "node_type": "Log",
+      "definition": "Per-(tenant, plan_version, tenant_cluster) rolling global aggregated counters for rate, cost, concurrent subscriptions, and other plan-bounded resources. Bursty during metering. Compaction folds time-period aggregates into per-period summaries; raw deltas are not retained. Carries HLC stamps and schema_version tags.",
+      "aspects": []
+    },
+    {
+      "id": "control_lane",
+      "node_type": "Log",
+      "definition": "Tenant residency policies (versioned with effective-from HLC stamps; 2PC PREPARE/COMMIT/ABORT entries with prepared-V+1, prepared-ack-from-tenant-store, activate-V+1, abort-V+1 idempotent on (tenant_key, V+1, attempt_id), prepared-orphan); rotation schedule (cert/origin/pool/region-drain entries; rotation-in-progress and drain-in-progress tags); pause-in-progress entries; schema-version capability config entries; offboarding attestations including 'complete-with-exceptions' state and exception register; per-(offboarding_id, component_id) durable phase markers (RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL); flag-applied attestations from flag_propagator; pre-warm-stalled and pre-warm-deferred consumer state; operator-credential roster entries (versioned roster_version with HLC publication, per-credential issuance/expiry HLC validity windows, scheduled rotation entries; 2PC rotation-prepare and rotation-activate entries; compromise-revocation entries with retroactive-as-of-HLC); cert-bootstrap state (anchor-availability-test results, anchor-rotation entries, emergency-recovery events); audit schema registry from compliance_audit_owner; classification entries from gateway_health_surface (cross-witness-pending, classification-active, operator-driven-Subrole-transitions); compromise-revoked credential set; emergency-cert-recovery events. Rotation events compact post-completion; attestations compact after forwarding to metrics_store; residency policies retain version history under snapshot; roster history retained in full through snapshots so revocation semantics survive compaction. Carries HLC stamps and schema_version tags.",
+      "aspects": []
+    },
+    {
+      "id": "credential_roster",
+      "node_type": "Subservice",
+      "definition": "Owns the operator-credential roster published to all override-admission consumers (lifecycle_gate, tip_quorum, offboarding_orchestrator, flag_propagator, residency_publisher, lease_issuer, cert_bootstrap, compliance_audit_owner). Maintains versioned roster entries (roster_version, HLC-stamped publication timestamp, per-credential issuance/expiry HLC validity windows) committed via quorum_core into control_lane. Roster mutations (issue, rotate, revoke) are themselves M-of-N-authorized CAS proposals through quorum_core; credential issuance uses the elevated-threshold tier consistent with cert re-rooting elevation. Cold-start and post-full-revocation re-bootstrap of the roster is rooted in cert_bootstrap's OOB anchor (calls cert_bootstrap before publishing any new roster_version when no prior roster exists or the prior roster is fully compromise-revoked). Roster rotation is itself a 2PC: rotation-prepare commits a prepared-V+1 entry to control_lane and broadcasts it to every override-admission consumer (carrying current roster_version and prepared roster_version); collects per-consumer ack on a documented push-and-acknowledge channel; rotation-activate is M-of-regions quorum-witnessed and only executes once the per-region ack quorum is met; consumers consult the active roster_version on every commit so a laggard consumer cannot admit a proposal that the activated roster has invalidated. In-flight override proposals at rotation-activate HLC are cancel-by-roster-version atomically with the activation broadcast: lifecycle_gate, tip_quorum, residency_publisher, lease_issuer must CAS-reject any pending override commit whose signing roster_version predates the active roster_version. Compromise-revocation events carry a retroactive-as-of-HLC field (usually equal to the revocation HLC; may be set earlier under M-of-N with elevated-issuance threshold when forensics establish compromise predates discovery); credential_roster broadcasts the compromise-revocation through the same channel as rotation-activate so consumers re-validate in-flight signatures and reject any signature whose HLC >= retroactive-as-of-HLC. Every roster mutation, rotation step, and compromise-revocation writes a typed entry to compliance_audit (parent) via compliance_audit_owner's schema registry. Per-target_consumer ack-tracking is monotonic per (consumer, roster_version): a consumer that missed activation-window for V+1 falls to deny-by-default for further override admissions until it ack-readies a strictly newer roster_version; late-arriving acks for an already-activated version do not flip producer-side decisions back. (Realizes inherited r-s5-roster-rotation-uniform-ordering, r-s5-broadcast-self-contained-credential, r-s4-roster-staleness-bound, r-s4-roster-rotation-race, r-s4-credential-issuance-provenance.)",
+      "aspects": []
+    },
+    {
+      "id": "cert_bootstrap",
+      "node_type": "Subservice",
+      "definition": "Out-of-band cert-bootstrap surface enumerated in cert-inventory: emergency cert recovery for the case where the inter-region channel cert has effectively expired before in-band rotation could commit and consensus over the channel itself is therefore unavailable. Rooted in an OOB trust anchor distinct from the inter-region channel cert chain: the anchor is itself an M-of-N quorum of hardware-rooted material (offline keys / hardware-rooted root-of-trust) distributed across geographically and organizationally distinct custodians; compromise or loss of any single anchor element is recoverable under the remaining quorum via a documented anchor-rotation procedure committed via quorum_core into control_lane. Anchor-availability is tested on a documented cadence (anchor-availability-test entries in control_lane) so a silent custodian failure cannot become apparent only at the moment of emergency recovery. cert recovery requires human authorization under the same M-of-N operator-credential model with an elevated threshold for cert re-rooting (consults credential_roster's elevated tier); credential_roster's cold-start / post-full-revocation re-bootstrap consults this anchor to root the bootstrap roster, since no in-band roster exists at that moment. Every recovery operation, anchor rotation, and anchor-availability-test result writes a typed entry to compliance_audit (parent) via compliance_audit_owner. The OOB surface is intentionally narrow: it admits only (a) cert re-rooting under elevated M-of-N; (b) roster-bootstrap publishing under elevated M-of-N; (c) anchor rotation under elevated M-of-N; (d) emergency lease re-bootstrap when all lease_issuer regions are simultaneously unavailable, scoped narrowly to lease re-bootstrap and not arbitrary lease issuance; nothing else. (Realizes inherited r-s4-oob-anchor-quorum and supports r-s5-lease-issuance-availability emergency re-bootstrap; satisfies bubble-region_coordinator-6 at zoom.)",
+      "aspects": []
+    },
+    {
+      "id": "gateway_health_surface",
+      "node_type": "Subservice",
+      "definition": "Per-region per-Subrole liveness publisher consumed by edge (parent) for residency-aware routing and reconnect-storm hints. Subroles include: gateway-active, fanout-suspended, chain_router-pool-rotating, address_index-tombstoning, usage_meter-degraded, region-coordinator-skew-degraded. Each Subrole sample carries a monotonic freshness signal (freshness_seq, sampled_hlc) so stale surfaces are detectable: edge rejects samples whose freshness_seq is below its last-observed freshness_seq for the (region, Subrole) pair, and treats samples whose sampled_hlc is older than the documented freshness window as stale-fallback (edge falls back to its documented stale-surface policy: residency-pinned operations deny-by-default for that region's Subrole, residency-neutral operations continue to serve under last-observed liveness). The freshness window is a tunable bounded by hlc_service's skew_bound + an inter-region propagation budget; hlc_service skew-degraded mode triggers a wider window with explicit annotation. Routing-affecting classifications (Subrole transitioning gateway-active -> fanout-suspended; chain_router-pool-rotating -> drained) are independently cross-witnessed: gateway_health_surface accepts a routing-affecting classification only after at least two regions' samples have committed entries to health_lane within a documented cross-witness window agreeing on the classification. Single-region routing-affecting classifications are held in a probationary state (classification_pending) with explicit cross-witness-pending annotation; if no cross-witness arrives within the cross-witness window, the classification is rejected and an alert is raised. Operator-driven Subrole transitions (manual force-suspend) are admitted via lifecycle_gate's CAS path and carry operator attribution end-to-end into health_lane. Reads tip_lane to correlate Subrole pool tip-staleness with chain_router-pool Subroles. Writes Subrole-transition events to compliance_audit (parent) via compliance_audit_owner. (Realizes inherited r-s4-gateway-health-integrity zoom-level concerns: freshness window, cross-witness construction, stale-surface fallback policy.)",
+      "aspects": []
+    },
+    {
+      "id": "compliance_audit_owner",
+      "node_type": "Subservice",
+      "definition": "Owns the schema and admission contract for region_coordinator's writes to compliance_audit (parent Store). Maintains a typed audit-record schema registry (operator-override admission, OOB-anchor use, cert re-rooting, offboarding attestation, residency policy_version 2PC PREPARE/COMMIT/ABORT, roster mutation, compromise-revocation, anchor rotation, lease issuance, lease handoff-fence, audit-key DESTROYED, certificate-of-deletion, drain-fence broadcast, drain-ack, partial-with-witnesses, erasure-incomplete, prepared-orphan, anchor-availability-test) committed via quorum_core into control_lane; schema_version-tagged so cross-component schema evolution is itself a quorum-committed config entry. Arbitrates audit-key destruction sequencing as PHASE B counterpart to lifecycle_gate's PHASE A drain-fence-broadcast: lifecycle_gate computes the earliest-permissible t_destroy = max(observed_ack_hlc, fence_HLC + skew_bound) + write-delivery-grace; compliance_audit_owner publishes the bound for write-delivery-grace (compliance_audit's inbound-queue residence time bound) and exposes a late-write-rejection contract: when lifecycle_gate's audit-key DESTROYED entry commits to lease_lane, compliance_audit_owner installs a (writer_id, encrypted-at-HLC) admission cutoff for tenant T at compliance_audit; subsequent late writes whose encrypted-at-HLC > writer's drain-ack-HLC for T are rejected at admission and surfaced to a protocol-violation log. Two-tier audit material discipline: TIER 1 per-tenant-key shredded ciphertext payload; TIER 2 organizational-long-lived structural witness (event type, HLC, originating component, hash commitment to Tier-1 payload) under OOB-anchor key hierarchy provided by cert_bootstrap; certificate-of-deletion vouches for Tier-2 witnesses post-shred. Reads tombstone_lane (erasure-tombstone for tenant T to begin the fence sequence), control_lane (audit schema registry, audit-key destruction state), lease_lane (DESTROYED events sequenced with lease handoff). Writes typed audit-schema-registry entries and audit-key destruction-state entries to control_lane; writes typed certificate-of-deletion records and protocol-violation-log entries to compliance_audit (parent) directly under its own admission contract. Consults credential_roster on every schema-mutation and certificate-of-deletion issuance (M-of-N authorized). (Realizes inherited r-s5-audit-key-destruction-fence at zoom; supports r-s5-drain-fence-protocol PHASE B; supports the two-tier audit-material discipline and crypto-shred reconciliation introduced at root.)",
+      "aspects": []
+    },
+    {
+      "id": "lease_issuer",
+      "node_type": "Subservice",
+      "definition": "Issues per-tenant single-writer lease tokens consumed by tenant_store (parent) for CAS-on-(record_version, lease_id). Lease tokens carry HLC-bounded TTL and a monotonic lease_id within (tenant_key); successor leases supersede prior leases via lease_id ordering, never via wall-clock. Issuance is M-of-regions quorum-witnessed: lease_issuer commits a lease-prepared entry to lease_lane via quorum_core, broadcasts to peer regions, collects M-of-regions acks, then commits a lease-activated entry; tenant_store accepts only writes under an activated lease_id. Renewal: a lease holder may request TTL extension before TTL expiry; lease_issuer commits a lease-renewed entry to lease_lane under the same lease_id with extended HLC TTL bound, M-of-regions quorum-witnessed. Revocation: lease holder may relinquish, or lifecycle_gate (during offboarding) may force-revoke; force-revoke writes a lease-revoked entry to lease_lane and a corresponding tombstone-style entry to tombstone_lane so flag_propagator surfaces the revocation. Handoff: when lease ownership transfers to a successor writer (e.g., region failover, planned migration), lease_issuer issues lease_v_new only AFTER receiving a handoff-recorded ack from tenant_store: lease_issuer writes an HLC-stamped handoff-fence entry to lease_lane, calls tenant_store's handoff-fence acknowledgement endpoint, awaits ack confirming the fence is observable to all subsequent writes for that tenant key, then commits lease-activated for lease_v_new. Without this ack, lease_issuer MUST NOT issue lease_v_new; the ack is itself audited via compliance_audit_owner. Emergency re-bootstrap: when all lease_issuer regions are simultaneously unavailable (full lease-issuer-plane outage), lease re-bootstrap is rooted in cert_bootstrap's OOB anchor under elevated M-of-N (narrowly scoped to lease re-bootstrap; no arbitrary lease issuance through this path). Issuance, renewal, revocation, handoff-fence-ack, emergency re-bootstrap operations are credentialed: lease_issuer consults credential_roster on every commit; signing roster_version is captured on the lease_lane entry. Lease-stale, lease-superseded, and residency-miss are three distinct deny classes returned to tenant_store at admission for diagnostic/operator clarity. Reads lease_lane (own state), tombstone_lane (erasure-tombstone for tenant invalidation), control_lane (residency policy, current roster_version, region availability for M-of-regions calculation). Issuer-plane availability target is documented separately from the inter-region channel itself. (Realizes inherited r-s5-lease-issuance-availability, r-s5-lease-handoff-fence-ack.)",
+      "aspects": []
+    },
+    {
+      "id": "lease_lane",
+      "node_type": "Log",
+      "definition": "Per-(tenant_key) lease state lane: lease-prepared, lease-activated, lease-renewed, lease-revoked, lease-superseded entries for each (tenant_key, lease_id); HLC-stamped handoff-fence records committed when ownership transfers; audit-key DESTROYED events for tenant T committed by lifecycle_gate (PHASE B). Reserved consensus throughput sized for per-tenant lease ops including renewal cadence and bulk-offboarding revocation waves. Compaction retains the latest committed lease entry per (tenant_key) plus the trailing handoff-fence and any DESTROYED entry; superseded lease history compacts at snapshot. Carries HLC stamps and schema_version tags.",
+      "aspects": []
+    },
+    {
+      "id": "health_lane",
+      "node_type": "Log",
+      "definition": "Per-(region, Subrole) liveness sample lane carrying monotonic freshness signals (freshness_seq, sampled_hlc) for gateway-active, fanout-suspended, chain_router-pool-rotating, address_index-tombstoning, usage_meter-degraded, region-coordinator-skew-degraded Subroles. Routing-affecting classification entries are committed only after cross-witness from at least two regions agreeing within the documented cross-witness window; classification-pending entries are admissible and explicitly annotated. Reserved consensus throughput separate from tip_lane so tip-frequency does not crowd health-frequency. Compaction retains only the latest committed sample per (region, Subrole) plus the trailing classification-history within the cross-witness window plus any classification-pending probationary entries; older samples drop at snapshot. Carries HLC stamps and schema_version tags.",
+      "aspects": []
+    }
+  ],
+  "edges": [
+    [
+      "lifecycle_gate",
+      "tip_quorum",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "quota_aggregator",
+      "quorum_core",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "lifecycle_gate",
+      "quorum_core",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "quota_aggregator",
+      "hlc_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "offboarding_orchestrator",
+      "quorum_core",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "tip_quorum",
+      "quorum_core",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "lifecycle_gate",
+      "hlc_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "tip_quorum",
+      "hlc_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "residency_publisher",
+      "quorum_core",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "quorum_core",
+      "tombstone_lane",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "quorum_core",
+      "tip_lane",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "quorum_core",
+      "aggregate_lane",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "quorum_core",
+      "control_lane",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "quota_aggregator",
+      "aggregate_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "quota_aggregator",
+      "tombstone_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "quota_aggregator",
+      "control_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "flag_propagator",
+      "tombstone_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "flag_propagator",
+      "quorum_core",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "tip_quorum",
+      "tip_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "tip_quorum",
+      "control_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "residency_publisher",
+      "control_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "lifecycle_gate",
+      "control_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "lifecycle_gate",
+      "tip_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "offboarding_orchestrator",
+      "tombstone_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "offboarding_orchestrator",
+      "control_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "hlc_service",
+      "control_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "credential_roster",
+      "quorum_core",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "cert_bootstrap",
+      "quorum_core",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "gateway_health_surface",
+      "quorum_core",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "compliance_audit_owner",
+      "quorum_core",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "lease_issuer",
+      "quorum_core",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "credential_roster",
+      "hlc_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "cert_bootstrap",
+      "hlc_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "gateway_health_surface",
+      "hlc_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "compliance_audit_owner",
+      "hlc_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "lease_issuer",
+      "hlc_service",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "quorum_core",
+      "lease_lane",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "quorum_core",
+      "health_lane",
+      {
+        "edge_type": "writes_to"
+      }
+    ],
+    [
+      "credential_roster",
+      "control_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "cert_bootstrap",
+      "control_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "gateway_health_surface",
+      "health_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "gateway_health_surface",
+      "tip_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "gateway_health_surface",
+      "control_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "compliance_audit_owner",
+      "control_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "compliance_audit_owner",
+      "tombstone_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "compliance_audit_owner",
+      "lease_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "lease_issuer",
+      "lease_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "lease_issuer",
+      "control_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "lease_issuer",
+      "tombstone_lane",
+      {
+        "edge_type": "reads_from"
+      }
+    ],
+    [
+      "credential_roster",
+      "cert_bootstrap",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "lifecycle_gate",
+      "compliance_audit_owner",
+      {
+        "edge_type": "calls"
+      }
+    ],
+    [
+      "lease_issuer",
+      "cert_bootstrap",
+      {
+        "edge_type": "calls"
+      }
+    ]
+  ],
+  "requirements": [
+    {
+      "id": "IR-cert-rotation-staggered",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "Cert and origin-endpoint rotations are region-staggered: at most one region transitions a given cert-bearing surface inside a maintenance window. Simultaneous expiry across regions is prevented by construction.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-origin-rotation",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "Origin endpoints (gateway-accepted IP/hostname pairs) rotate on a documented cadence under the same region-staggered gate as cert rotation.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-rotation-coordinator-gate",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "Chain pool rotations are gated globally to one pool, one region, one wave at a time, and are admitted only while the canonical-tip quorum size remains above its safe threshold throughout.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-rotation-aware-skew",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "Rotation events surface a 'rotation in progress' tag in state_log so chain_router's schema-skew and tip-divergence quarantines suppress quarantines triggered solely by the documented rotation window.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-per-fork-canonical-tip",
+      "targets": [
+        {
+          "Node": "tip_quorum"
+        }
+      ],
+      "description": "A single canonical-tip view per (chain, fork) is maintained by quorum across regional chain pools and reported as such; tenants subscribe to or query an explicit (chain, fork) pair.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-stale-pool-quorum-exclusion",
+      "targets": [
+        {
+          "Node": "tip_quorum"
+        }
+      ],
+      "description": "Canonical-tip quorum excludes votes from any chain pool currently in tip-stale state, so a stalled regional pool cannot anchor the global canonical-tip view.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-rollback-coherent",
+      "targets": [
+        {
+          "Node": "tip_quorum"
+        }
+      ],
+      "description": "Reorg rollback notifications are keyed on globally-meaningful chain coordinates so every region emits a coherent rollback regardless of when its local chain pool observed the reorg.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-offboarding-teardown",
+      "targets": [
+        {
+          "Node": "offboarding_orchestrator"
+        }
+      ],
+      "description": "Tenant offboarding triggers an end-to-end teardown sequence: gateway closes subscriptions with structured reason, fanout drops them, address_index tombstones watch claims, chain_router cancels in-flight long-RPCs, usage_meter freezes the cost record. Per-component offboarding attestations are collected into the compliance audit trail.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-quota-aggregation",
+      "targets": [
+        {
+          "Node": "quota_aggregator"
+        }
+      ],
+      "description": "Per-(tenant, plan_version, tenant_cluster) usage deltas reported by every region's usage_meter are aggregated globally on a sub-second cadence, and crossing a per-plan ceiling or per-cluster quota proposes a throttle-flag tombstone.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-flag-fast-path",
+      "targets": [
+        {
+          "Node": "flag_propagator"
+        }
+      ],
+      "description": "Tombstoned flags (throttle, plan-change, cluster-suspended, key-revocation, preservation-hold, erasure-tombstone) propagate to every region's auth_cache via a single unified fast-path that runs ahead of fine-grained counter replication, with global ordering preserved.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-residency-policy-publish",
+      "targets": [
+        {
+          "Node": "residency_publisher"
+        }
+      ],
+      "description": "Each tenant's residency policy is owned canonically here, written as a versioned record, and pushed to every consumer (edge, gateway, usage_meter, metrics_store) so policy enforcement is consistent across components.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-hlc-distribution",
+      "targets": [
+        {
+          "Node": "hlc_service"
+        }
+      ],
+      "description": "A hybrid-logical clock is distributed to subscribers (gateway, fanout, internal subservices) with bounded inter-region skew; observed skew above threshold puts the affected region into the documented degraded mode.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "IR-not-spof",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "region_coordinator is logically a single global service but physically deployed as a quorum across regions: failure of any single region or replica does not cause loss of canonical state or progress, as long as a quorum survives.",
+      "origin": {
+        "type": "Initial"
+      }
+    },
+    {
+      "id": "SR1-partition-degraded-read",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "On a network partition, minority-region subservices serve reads from locally-applied state_log with an explicit 'partition-stale' freshness annotation; clients distinguish locally-fresh from globally-fresh state.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-quorum-partition"
+      }
+    },
+    {
+      "id": "SR1-partition-proposal-reject",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "Proposals originating in a minority region are rejected fast with a retryable-on-quorum-region signal rather than buffered indefinitely; upstream uses the signal to shed load.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-quorum-partition"
+      }
+    },
+    {
+      "id": "SR1-partition-input-buffer",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "Inputs that cannot be discarded (usage_meter deltas, chain_router head observations, erasure tombstones) buffer in the minority region under a bounded watermark with an explicit overflow policy (drop-with-loss-attestation for low-severity, alert-escalation for high-severity).",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-quorum-partition"
+      }
+    },
+    {
+      "id": "SR1-partition-heal-replay",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "On partition heal, buffered minority-region work is replayed via quorum_core with idempotency keys so duplicates can land but only commit once; ordering is reconstructed from HLC stamps captured at input time.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-quorum-partition"
+      }
+    },
+    {
+      "id": "SR1-log-snapshot-truncate",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "quorum_core takes consistent snapshots at watermark intervals and truncates the log prefix; replicas at cold start or far-behind catch up via snapshot transfer plus log tail rather than full-log replay.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-log-unbounded"
+      }
+    },
+    {
+      "id": "SR1-tip-source-rate-limit",
+      "targets": [
+        {
+          "Node": "tip_quorum"
+        }
+      ],
+      "description": "Per-source rate limit on chain_router head-observation submissions to tip_quorum; observations beyond rate are dropped with a metric and source flagged.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-tip-observation-flood"
+      }
+    },
+    {
+      "id": "SR1-fork-admission-threshold",
+      "targets": [
+        {
+          "Node": "tip_quorum"
+        }
+      ],
+      "description": "A (chain, fork_id) candidate is admitted as a tracked pair only after N independent regional observations across a documented window; below threshold the fork_id is held in a probationary set and not committed to state_log.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-tip-observation-flood"
+      }
+    },
+    {
+      "id": "SR1-tip-source-quarantine",
+      "targets": [
+        {
+          "Node": "tip_quorum"
+        }
+      ],
+      "description": "tip_quorum quarantines chain_router replicas whose observation pattern violates per-source rate or cross-source-correlation rules; quarantines surface as alerts and are visible in the state_log so canonical-tip computation excludes the quarantined source.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-tip-observation-flood"
+      }
+    },
+    {
+      "id": "SR1-hlc-bounded-sample",
+      "targets": [
+        {
+          "Node": "hlc_service"
+        }
+      ],
+      "description": "HLC samples beyond a documented max-allowed-delta from the local HLC are discarded; the offending source is flagged but does not advance the local clock.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-hlc-poisoning"
+      }
+    },
+    {
+      "id": "SR1-hlc-multi-peer-consensus",
+      "targets": [
+        {
+          "Node": "hlc_service"
+        }
+      ],
+      "description": "Cross-region HLC distribution computes the local HLC from a multi-peer median (N >= 3) rather than trusting any single peer; a single misbehaving peer cannot drag the cluster off-time.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-hlc-poisoning"
+      }
+    },
+    {
+      "id": "SR1-hlc-auto-degraded",
+      "targets": [
+        {
+          "Node": "hlc_service"
+        }
+      ],
+      "description": "A region whose hlc_service cannot agree with multi-peer median within max-allowed-delta for a documented window is automatically forced into the skew-degraded mode (parent R-bounded-clock-skew) and stops accepting writes that depend on time-bucketed enforcement.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-hlc-poisoning"
+      }
+    },
+    {
+      "id": "SR1-attestation-timeout",
+      "targets": [
+        {
+          "Node": "offboarding_orchestrator"
+        }
+      ],
+      "description": "Each downstream component participating in offboarding teardown has a documented attestation SLO; on timeout, offboarding_orchestrator records a best-effort attestation with evidence and escalation owner instead of waiting indefinitely.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-stalled-offboarding"
+      }
+    },
+    {
+      "id": "SR1-complete-with-exceptions",
+      "targets": [
+        {
+          "Node": "offboarding_orchestrator"
+        }
+      ],
+      "description": "The aggregate certificate of deletion can be issued in a documented 'complete-with-exceptions' state where every component has either a timely attestation or a recorded best-effort attestation with evidence; exceptions are tracked in a separate register with their own SLA on resolution.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-stalled-offboarding"
+      }
+    },
+    {
+      "id": "SR1-erasure-preservation-precedence",
+      "targets": [
+        {
+          "Node": "offboarding_orchestrator"
+        }
+      ],
+      "description": "Where a preservation hold (parent R-preservation-hold) covers a data class that erasure would touch, the affected component returns a 'preservation-blocked' attestation with the hold reference; this is a recognized terminal state for that component's attestation rather than a stall.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-stalled-offboarding"
+      }
+    },
+    {
+      "id": "SR1-rotation-cas-admission",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "Pool-rotation admission is committed via quorum_core as a CAS proposal that includes its own preconditions (per-(chain, fork) quorum-size set, rotation-in-progress set, tip-stale set); the proposal commits only if those preconditions still hold at commit time.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-rotation-gate-toctou"
+      }
+    },
+    {
+      "id": "SR1-rotation-precondition-revalidate",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "On rejection, lifecycle_gate re-reads the latest applied state and may re-propose with refreshed preconditions; lifecycle_gate never relies on a precondition snapshot older than its current proposal.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-rotation-gate-toctou"
+      }
+    },
+    {
+      "id": "SR1-residency-versioned",
+      "targets": [
+        {
+          "Node": "residency_publisher"
+        }
+      ],
+      "description": "Residency policies are versioned with effective-from HLC stamps; consumers pin and propagate the version they enforced so mismatch is detectable downstream.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-residency-stale-push"
+      }
+    },
+    {
+      "id": "SR1-residency-two-phase-tightening",
+      "targets": [
+        {
+          "Node": "residency_publisher"
+        }
+      ],
+      "description": "Tightening residency changes use a two-phase apply: a push-and-acknowledge phase (effective-from in the future) followed by a globally-ordered activation; until activation, the old version is enforced.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-residency-stale-push"
+      }
+    },
+    {
+      "id": "SR1-residency-deny-default",
+      "targets": [
+        {
+          "Node": "residency_publisher"
+        }
+      ],
+      "description": "Consumers that fail to acknowledge readiness within the push-and-acknowledge window default to deny-by-default for the affected tenant rather than serve under the old version past activation.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-residency-stale-push"
+      }
+    },
+    {
+      "id": "SR1-schema-capability-negotiation",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "Admission of a new schema_version is a quorum-committed capability config entry (analogous to Raft membership change); until that config commits, leaders restrict writes to the previous schema_version.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-schema-evolution"
+      }
+    },
+    {
+      "id": "SR1-schema-rollout-gated",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "Replica code rollouts that introduce a new schema_version are region-staggered under lifecycle_gate; the schema-capability config entry is committed only after every replica has been upgraded — a two-phase upgrade (deploy, then activate).",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-schema-evolution"
+      }
+    },
+    {
+      "id": "SR1-region-drain-event",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "Region-drain is a first-class lifecycle event in state_log distinct from pool rotation; lifecycle_gate schedules and admits it through the same CAS proposal mechanism.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-region-drain-vs-rotation"
+      }
+    },
+    {
+      "id": "SR1-drain-aware-threshold",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "lifecycle_gate's quorum-size safety threshold is evaluated against the post-drain configuration: rotations are not blocked merely because a drain is in flight, but rotations whose admission would drop the post-drain quorum below safe are rejected.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-region-drain-vs-rotation"
+      }
+    },
+    {
+      "id": "SR1-mutual-scheduling",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "At most one region-drain plus one pool-rotation are in flight globally; mutual scheduling is enforced by lifecycle_gate's admission rules so drains and rotations cannot starve each other indefinitely.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-region-drain-vs-rotation"
+      }
+    },
+    {
+      "id": "SR1-fast-path-slo",
+      "targets": [
+        {
+          "Node": "flag_propagator"
+        }
+      ],
+      "description": "flag_propagator has a documented per-region delivery SLO for the unified fast-path; the SLO is monitored independently of bulk propagation rate and breach raises an alert.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-cluster-suspension-race"
+      }
+    },
+    {
+      "id": "SR1-deny-during-propagation",
+      "targets": [
+        {
+          "Node": "flag_propagator"
+        }
+      ],
+      "description": "For high-severity flags (cluster-suspended, key-revocation, erasure-tombstone), flag_propagator publishes a pending-marker to every region's auth_cache before the per-region apply lands; auth_cache treats the pending marker as deny-during-propagation so the affected cluster_id cannot serve traffic in the propagation window.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-cluster-suspension-race"
+      }
+    },
+    {
+      "id": "SR1-flag-applied-attestation",
+      "targets": [
+        {
+          "Node": "flag_propagator"
+        }
+      ],
+      "description": "Per-region apply of a fast-path flag produces a flag-applied attestation written back through quorum_core; a flag is globally-active only after attestations from every region land, and lagging regions are flagged in alerts.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-cluster-suspension-race"
+      }
+    },
+    {
+      "id": "SR1-idempotency-keys",
+      "targets": [
+        {
+          "Node": "offboarding_orchestrator"
+        }
+      ],
+      "description": "Every offboarding signal from offboarding_orchestrator to a downstream component carries an idempotency key (offboarding_id, component_id, attempt_id) committed via quorum_core's tombstone-lane so the signal survives leader change.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-attestation-replay"
+      }
+    },
+    {
+      "id": "SR1-attestation-dedup",
+      "targets": [
+        {
+          "Node": "offboarding_orchestrator"
+        }
+      ],
+      "description": "offboarding_orchestrator dedupes incoming attestations by idempotency key before aggregating into the certificate of deletion; duplicate attestations land but only the first is counted.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-attestation-replay"
+      }
+    },
+    {
+      "id": "SR1-log-retention-classes",
+      "targets": [
+        {
+          "Node": "tombstone_lane"
+        },
+        {
+          "Node": "tip_lane"
+        },
+        {
+          "Node": "aggregate_lane"
+        },
+        {
+          "Node": "control_lane"
+        }
+      ],
+      "description": "Every log entry kind declares an explicit retention class with documented compaction semantics (latest-only, bounded-history, periodic-summary, full-history-with-snapshot); each lane (tombstone, tip, aggregate, control) implements compaction per the kinds it carries.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-log-unbounded"
+      }
+    },
+    {
+      "id": "SR1-log-tombstone-history",
+      "targets": [
+        {
+          "Node": "tombstone_lane"
+        }
+      ],
+      "description": "Tombstone entry kinds (revocation, plan-change, cluster-suspended, preservation-hold, erasure) preserve full ordering history through snapshots so revocation semantics survive compaction and any region's hydration sees the same tombstone state.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-log-unbounded"
+      }
+    },
+    {
+      "id": "SR1-write-class-lanes",
+      "targets": [
+        {
+          "Node": "tombstone_lane"
+        },
+        {
+          "Node": "tip_lane"
+        },
+        {
+          "Node": "aggregate_lane"
+        },
+        {
+          "Node": "control_lane"
+        }
+      ],
+      "description": "The committed log is partitioned into write-class lanes — tombstone_lane (latency-critical), tip_lane (high-frequency), aggregate_lane (bursty), control_lane (low-frequency) — each with reserved consensus throughput and head-of-line isolation to its own lane.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-hot-write-contention"
+      }
+    },
+    {
+      "id": "SR1-tombstone-lane-slo",
+      "targets": [
+        {
+          "Node": "tombstone_lane"
+        }
+      ],
+      "description": "tombstone_lane has a documented per-class SLO upper-bounding end-to-end commit latency for latency-critical flags (revocation, throttle, cluster-suspended, preservation-hold, erasure), monitored independently of bulk throughput.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-hot-write-contention"
+      }
+    },
+    {
+      "id": "SR1-cross-lane-ordering",
+      "targets": [
+        {
+          "Node": "tombstone_lane"
+        },
+        {
+          "Node": "tip_lane"
+        },
+        {
+          "Node": "aggregate_lane"
+        },
+        {
+          "Node": "control_lane"
+        }
+      ],
+      "description": "Cross-lane causal ordering relevant to consumers (e.g. a revocation that must precede an attestation) is resolved via HLC stamps captured at write time so consumers can reconstruct happens-before across lanes.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-hot-write-contention"
+      }
+    },
+    {
+      "id": "SR1-schema-tagged-entries",
+      "targets": [
+        {
+          "Node": "tombstone_lane"
+        },
+        {
+          "Node": "tip_lane"
+        },
+        {
+          "Node": "aggregate_lane"
+        },
+        {
+          "Node": "control_lane"
+        }
+      ],
+      "description": "Every log entry across all lanes is tagged with the schema_version that produced it; consumers reject entries with schema_version higher than they support.",
+      "origin": {
+        "type": "Stressor",
+        "session": 1,
+        "stressor": "s-schema-evolution"
+      }
+    },
+    {
+      "id": "SR2-cas-backoff",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "CAS proposers (lifecycle_gate, quota_aggregator, tip_quorum, residency_publisher, flag_propagator, offboarding_orchestrator) apply exponential backoff with jitter on CAS rejection; quorum_core surfaces leader-change rejections as a transient-error code distinct from precondition-violation so proposers do not immediately re-propose with stale preconditions",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "cas-retry-storm"
+      }
+    },
+    {
+      "id": "SR2-cas-admission",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "quorum_core enforces a per-proposer in-flight CAS budget and a global CAS admission rate so a thrashing proposer cannot saturate consensus throughput; over-budget proposals are rejected fast with a retryable-with-backoff signal",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "cas-retry-storm"
+      }
+    },
+    {
+      "id": "SR2-snapshot-atomic-install",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "Snapshot install on a replica is atomic via an intent-then-commit protocol: the replica writes a snapshot-installing intent marker before any state mutation, replaces state files, then writes a snapshot-commit marker. On restart, an intent without matching commit forces full discard of partial snapshot state and re-fetch from quorum.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "snapshot-half-applied"
+      }
+    },
+    {
+      "id": "SR2-needs-snapshot-state",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "A replica with an in-progress or failed snapshot install enters a NEEDS_SNAPSHOT state visible to the quorum; in that state the replica does not vote, does not serve reads (including partition-stale reads), and does not count toward the quorum-size threshold until snapshot install commits and log-tail catch-up completes.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "snapshot-half-applied"
+      }
+    },
+    {
+      "id": "SR2-pending-marker-rate-limit",
+      "targets": [
+        {
+          "Node": "flag_propagator"
+        }
+      ],
+      "description": "flag_propagator enforces a per-target_identity rate limit on pending-marker publication. Pending-markers beyond the rate are dropped with a metric and the originating proposer is flagged; the rate limit is independent of the unified fast-path's per-region delivery SLO so DoS attempts on pending-markers cannot also starve legitimate flag delivery.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "pending-marker-dos"
+      }
+    },
+    {
+      "id": "SR2-pending-marker-bound",
+      "targets": [
+        {
+          "Node": "flag_propagator"
+        }
+      ],
+      "description": "Pending-markers carry an originating-proposal-id and an HLC expiry bound. A pending-marker without a corresponding in-flight or committed tombstone proposal in tombstone_lane is rejected; on expiry the marker auto-clears in auth_cache, so a stalled or rejected proposal cannot indefinitely deny traffic.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "pending-marker-dos"
+      }
+    },
+    {
+      "id": "SR2-probationary-timeout",
+      "targets": [
+        {
+          "Node": "tip_quorum"
+        }
+      ],
+      "description": "tip_quorum surfaces an alert when a probationary (chain, fork_id) candidate exceeds a documented max-probationary-window without reaching the N-region admission threshold; the alert lists the observed-region-set and the absent-region-set so operators can correlate against ongoing region-drain or rotation events.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "probationary-fork-starvation"
+      }
+    },
+    {
+      "id": "SR2-probationary-override",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "An operator-override admission path exists for probationary forks: lifecycle_gate accepts a CAS proposal that admits a probationary (chain, fork_id) over the threshold shortfall, gated on the absent-region-set being explainable by current drain-in-progress or rotation-in-progress entries in control_lane. The override commits to tip_lane with operator attribution and is visible in tip_quorum's reorg notifications.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "probationary-fork-starvation"
+      }
+    },
+    {
+      "id": "SR2-quota-pre-aggregation",
+      "targets": [
+        {
+          "Node": "quota_aggregator"
+        }
+      ],
+      "description": "quota_aggregator pre-aggregates incoming usage deltas in-memory by (tenant, plan_version, tenant_cluster, HLC bucket) before proposing to aggregate_lane, so consensus throughput on aggregate_lane scales with bucket count rather than raw delta arrival rate.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "aggregate-lane-backpressure"
+      }
+    },
+    {
+      "id": "SR2-quota-shed-by-class",
+      "targets": [
+        {
+          "Node": "quota_aggregator"
+        }
+      ],
+      "description": "When the pre-aggregation buffer exceeds a documented watermark, quota_aggregator sheds by ceiling-proximity class: aggregates well under the per-plan ceiling are dropped first with a loss-attestation; aggregates near or crossing a ceiling retain admission priority into aggregate_lane so throttle-flag tombstones are not delayed by low-severity delta floods.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "aggregate-lane-backpressure"
+      }
+    },
+    {
+      "id": "SR2-cert-overlap-window",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "Inter-region channel cert rotation runs with an overlap window: lifecycle_gate admits a cert rotation only when remaining validity on the active cert exceeds a documented overlap budget. During the overlap, both old and new cert are trusted on the inter-region channel so consensus on the rotation itself rides the old cert while the new cert is distributed via control_lane; trust handover to the new cert is atomic at the HLC effective-from stamp recorded with the rotation entry.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "cert-rotation-bootstrap"
+      }
+    },
+    {
+      "id": "SR2-cert-emergency-recovery",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "If the overlap window is breached (no successful rotation committed before the active cert nears expiry), lifecycle_gate raises an emergency-cert-recovery event in control_lane and stops admitting any non-cert-rotation lifecycle events. Recovery from total cert expiry is delegated to a parent-scope out-of-band bootstrap surface — region_coordinator alone cannot recover consensus over a channel whose only authenticator has expired.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "cert-rotation-bootstrap"
+      }
+    },
+    {
+      "id": "SR2-pause-event-class",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "Documented operational pauses (VM live migration and any successor pause classes) are first-class lifecycle events scheduled and admitted by lifecycle_gate via CAS into control_lane, with a recorded pause-window and the affected region(s).",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "hlc-pause-false-degraded"
+      }
+    },
+    {
+      "id": "SR2-pause-aware-hlc",
+      "targets": [
+        {
+          "Node": "hlc_service"
+        }
+      ],
+      "description": "hlc_service consults control_lane for pause-in-progress entries; while a pause-in-progress entry covers its region, sample-vs-median delta is evaluated against a wider pause-mode bound and the region does not auto-trip skew-degraded mode for delta excursions explainable by the pause. On pause-end, hlc_service re-syncs from multi-peer median and only then resumes normal max-allowed-delta enforcement.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "hlc-pause-false-degraded"
+      }
+    },
+    {
+      "id": "SR2-hlc-stamp-validated",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "quorum_core validates the HLC stamp on every lane entry at commit time: missing stamps and stamps beyond max-allowed-delta are rejected. Lane consumers can rely on stamps as monotonic within tolerance for cross-lane happens-before reconstruction.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "cross-lane-hlc-skew"
+      }
+    },
+    {
+      "id": "SR2-hlc-degraded-interlock",
+      "targets": [
+        {
+          "Node": "quorum_core"
+        }
+      ],
+      "description": "While the leader's hlc_service is in skew-degraded mode, quorum_core suspends admission of entry kinds that participate in security-critical cross-lane happens-before reconstruction (revocation-then-attestation, erasure-tombstone-then-offboarding-attestation, fast-path flag-applied attestations); other admissions carry an HLC-degraded annotation visible to consumers.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "cross-lane-hlc-skew"
+      }
+    },
+    {
+      "id": "SR2-region-distinct-admission",
+      "targets": [
+        {
+          "Node": "tip_quorum"
+        }
+      ],
+      "description": "tip_quorum's N independent observations for (chain, fork_id) admission must come from N distinct regions, not merely N distinct chain_router replicas; multiple replicas in the same region count once for the threshold so colluding replicas within a region cannot satisfy the threshold alone.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "quarantine-collusion-bypass"
+      }
+    },
+    {
+      "id": "SR2-set-level-correlation",
+      "targets": [
+        {
+          "Node": "tip_quorum"
+        }
+      ],
+      "description": "tip_quorum's source-quarantine rules include set-level cross-source correlation: a (chain, fork_id) candidate witnessed only by sources in suspicious correlation (synchronized timing, identical observation deltas, no other regional witness) is held probationary even when no single source violates per-source rate; the correlated set is surfaced in alerts.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "quarantine-collusion-bypass"
+      }
+    },
+    {
+      "id": "SR2-component-outage-breaker",
+      "targets": [
+        {
+          "Node": "offboarding_orchestrator"
+        }
+      ],
+      "description": "offboarding_orchestrator tracks per-downstream-component best-effort-attestation rate. Crossing a documented breaker threshold opens a component-outage state: new offboarding signals for that component are suspended, a component-outage alert is raised, and erasure tombstones that would touch the component's data class are held in a queued-pending-component-recovery state in tombstone_lane rather than rapidly accumulating best-effort attestations.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "best-effort-cascade"
+      }
+    },
+    {
+      "id": "SR2-queued-pending-class",
+      "targets": [
+        {
+          "Node": "tombstone_lane"
+        }
+      ],
+      "description": "tombstone_lane recognizes a queued-pending-component-recovery entry kind for erasure tombstones whose downstream component is in an open component-outage breaker state; the queue drains via normal offboarding flow once the breaker closes; the queue is itself audited and alerted if depth exceeds a documented bound.",
+      "origin": {
+        "type": "Stressor",
+        "session": 2,
+        "stressor": "best-effort-cascade"
+      }
+    },
+    {
+      "id": "bubble-tip_quorum-1",
+      "targets": [
+        {
+          "Node": "tip_quorum"
+        }
+      ],
+      "description": "lifecycle_gate's operator-override admission path needs an operator-credential authorization model with M-of-N signing requirements, credential-rotation, compromise-revocation, and per-operator audit so a single compromised credential cannot issue override admissions; tip_quorum implements local M-of-N gating but parent scope must define and enforce the operator credential model.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-residency-2pc",
+      "targets": [
+        {
+          "Node": "residency_publisher"
+        }
+      ],
+      "description": "residency_publisher implements 2PC PREPARE/COMMIT/ABORT: PREPARE binds prepared-V+1 to per-tenant quarantine-and-relocate-complete-ack from tenant_store; without ack residency_publisher cannot proceed. COMMIT activates V+1 via M-of-regions quorum-witnessed CAS, re-validating prepared-ack and per-region ack-quorum. ABORT is HLC-window-bounded and idempotent on (tenant_key, V+1, attempt_id); same abort_id twice is a no-op; strictly newer attempt_id starts fresh from V's current state. PREPARED-ORPHAN degraded mode on prepared-window expiry without commit.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-residency-prewarm",
+      "targets": [
+        {
+          "Node": "residency_publisher"
+        }
+      ],
+      "description": "residency_publisher provides a pre-warm hydration channel rate-limited per-region: on consumer cold-start the consumer requests pre-warm delivering currently-active V's full state synchronously, ack-readies inline as part of registration, only then begins serving residency-pinned traffic. Bounded queue depth, queue-overflow returns pre-warm-deferred, consumer falls to deny-by-default. Honors monotonic-per-(consumer, instance_id, version).",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-roster-2pc",
+      "targets": [
+        {
+          "Node": "credential_roster"
+        }
+      ],
+      "description": "credential_roster rotation is 2PC at zoom: rotation-prepare commits prepared-V+1 entry to control_lane and broadcasts to override-admission consumers; rotation-activate is M-of-regions quorum-witnessed; consumers consult active roster_version on every commit; in-flight override proposals at activate-HLC are cancel-by-roster-version atomically with the activation broadcast. Compromise-revocation carries retroactive-as-of-HLC; broadcasts whose emit-HLC >= retroactive-as-of-HLC become invalid and lifecycle_gate re-signs and re-broadcasts within bounded-batching.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-broadcast-self-contained",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "lifecycle_gate-signed broadcasts (drain-fence in particular) carry the signing roster_version as part of the broadcast itself; consumers verify signatures against the broadcast's NAMED roster_version, not a cached version. Signed broadcasts remain verifiable for the duration of their HLC-bounded ack window even after a scheduled roster rotation activates a strictly newer version.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-drain-fence",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "lifecycle_gate originates drain-fence broadcasts on observing erasure-tombstone for tenant T; broadcast carries fence-HLC f_T and signing roster_version; every named writer flushes in-flight audit writes for T to compliance_audit then acks drain to tenant_store within the HLC-bounded ack window; offboarding_orchestrator tracks per-(T, writer) ack state via durable phase markers.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-bounded-batching",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "lifecycle_gate admits bulk-offboarding waves with documented max-tenants-per-wave and inter-wave spacing; per-writer bounded ack queues with explicit back-pressure stall further wave admission rather than dropping broadcasts or expiring HLC windows; per-tenant HLC-bounded ack windows start from per-tenant ack-broadcast-emit-HLC, not from the bulk operator action HLC.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-teardown-overlap",
+      "targets": [
+        {
+          "Node": "lifecycle_gate"
+        }
+      ],
+      "description": "lifecycle_gate's teardown-overlap interlock: node-teardown is not admitted while any in-flight per-tenant drain-fence on that node is unacked. Nodes that cannot flush within their teardown window write a durable drain-ack-handoff record naming a successor instance or persistent buffer; ack-by-handoff is treated as ack for the certificate of deletion. No silent drop and no unbounded wait.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-lease-issuance",
+      "targets": [
+        {
+          "Node": "lease_issuer"
+        }
+      ],
+      "description": "lease_issuer issues per-tenant single-writer lease tokens with HLC-bounded TTL via M-of-regions quorum-witnessed activation pattern (lease-prepared then lease-activated); supports renewal under same lease_id with extended TTL; supports revocation; emergency lease re-bootstrap when all lease_issuer regions are simultaneously unavailable is rooted in cert_bootstrap's OOB anchor under elevated M-of-N narrowly scoped to lease re-bootstrap. Issuer-plane availability target documented separately from inter-region channel.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-lease-handoff-fence",
+      "targets": [
+        {
+          "Node": "lease_issuer"
+        }
+      ],
+      "description": "lease_issuer requires HLC-stamped handoff-fence ack from tenant_store before issuing lease_v_new: writes handoff-fence to lease_lane, calls tenant_store's handoff-fence acknowledgement endpoint, awaits ack confirming fence is observable to all subsequent writes for the tenant key, then commits lease-activated for lease_v_new. Without ack, lease_v_new MUST NOT be issued. Ack is audited via compliance_audit_owner.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-audit-key-destruction",
+      "targets": [
+        {
+          "Node": "compliance_audit_owner"
+        }
+      ],
+      "description": "Audit-key destruction is two-phase clock-skew-bounded fence: (PHASE A) drain-fence broadcast carries fence-HLC f_T; every writer must ack drain-of-in-flight-audit-writes-for-T at writer-local HLC >= f_T + skew_bound where skew_bound is hlc_service's degraded-mode bound. (PHASE B) lifecycle_gate's audit-key DESTROYED event for T is issued at HLC t_destroy >= max(observed_ack_hlc, f_T + skew_bound) + write-delivery-grace; compliance_audit_owner publishes write-delivery-grace and installs late-write-rejection cutoff at compliance_audit on DESTROYED commit. Late writes after the cutoff are rejected at admission and surfaced to a protocol-violation log.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-health-freshness",
+      "targets": [
+        {
+          "Node": "gateway_health_surface"
+        }
+      ],
+      "description": "gateway_health_surface publishes per-(region, Subrole) liveness samples carrying monotonic freshness signal (freshness_seq, sampled_hlc); freshness window is bounded by hlc_service skew_bound + inter-region propagation budget with wider window under skew-degraded; routing-affecting classifications require cross-witness from at least two regions agreeing within the documented cross-witness window; single-region classifications held probationary; stale-surface fallback at edge: residency-pinned operations deny-by-default, residency-neutral operations continue under last-observed liveness.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-cert-bootstrap-anchor",
+      "targets": [
+        {
+          "Node": "cert_bootstrap"
+        }
+      ],
+      "description": "cert_bootstrap's OOB trust anchor is M-of-N hardware-rooted material across geographically and organizationally distinct custodians with anchor-rotation procedure committed via quorum_core, anchor-availability-test cadence committed via control_lane; emergency cert recovery, roster-bootstrap, anchor rotation, and emergency lease re-bootstrap require human authorization under M-of-N with elevated threshold for cert re-rooting and roster-bootstrap; every operation writes a typed entry to compliance_audit via compliance_audit_owner.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-credential-roster-extracted",
+      "targets": [
+        {
+          "Node": "credential_roster"
+        }
+      ],
+      "description": "credential_roster is the single owner of operator-credential roster publication and consumer-ack tracking; lifecycle_gate, tip_quorum, residency_publisher, lease_issuer, flag_propagator, offboarding_orchestrator, compliance_audit_owner, cert_bootstrap consume the active roster_version via control_lane (committed by credential_roster through quorum_core) and CAS-reject any override commit whose effective roster_version is below active roster_version. credential_roster's cold-start / post-full-revocation re-bootstrap is rooted in cert_bootstrap's OOB anchor.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    },
+    {
+      "id": "r-zoom-rc-phase-markers",
+      "targets": [
+        {
+          "Node": "offboarding_orchestrator"
+        }
+      ],
+      "description": "offboarding_orchestrator maintains per-(offboarding_id, component_id) durable phase markers (RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL) in control_lane; never retracts a drain-ack already emitted for that key; observed_ack_hlc for the slowest writer is consumed by lifecycle_gate's PHASE B audit-key destruction t_destroy computation.",
+      "origin": {
+        "type": "Freestanding"
+      }
+    }
+  ],
+  "satisfactions": [
+    {
+      "requirement_id": "IR-not-spof",
+      "explanation": "quorum_core is the consensus engine deployed across regions; canonical state is committed only on quorum acknowledgement and applied to the per-class lanes (tombstone_lane, tip_lane, aggregate_lane, control_lane). Failure of any single region or replica does not cause loss of canonical state or progress as long as a quorum survives; minority-region partition handling (degraded reads + bounded buffers + heal-time replay) preserves the property under transient partition."
+    },
+    {
+      "requirement_id": "IR-cert-rotation-staggered",
+      "explanation": "lifecycle_gate's redefinition gates cert and origin-endpoint rotations region-staggered (at most one region transitions a given surface in a maintenance window); the schedule is a CAS proposal committed via quorum_core into control_lane so the staggering is canonical, not deployment discipline."
+    },
+    {
+      "requirement_id": "IR-origin-rotation",
+      "explanation": "lifecycle_gate gates origin-endpoint rotations under the same region-staggered cadence as cert rotation; rotation events are CAS-committed via quorum_core into control_lane."
+    },
+    {
+      "requirement_id": "IR-rotation-coordinator-gate",
+      "explanation": "lifecycle_gate's redefinition gates pool rotations to one pool / one region / one wave at a time, admitted via CAS proposals through quorum_core; the precondition payload includes the latest tip-quorum size set so the canonical-tip quorum size is held above its safe threshold throughout — atomically, not via a TOCTOU check."
+    },
+    {
+      "requirement_id": "IR-rotation-aware-skew",
+      "explanation": "lifecycle_gate writes rotation-in-progress and drain-in-progress tags via CAS through quorum_core into control_lane; chain_router (parent) reads those tags from control_lane to suppress quarantines triggered solely by the documented rotation window."
+    },
+    {
+      "requirement_id": "IR-per-fork-canonical-tip",
+      "explanation": "tip_quorum partitions head observations by (chain, fork) and computes a single canonical tip per pair via quorum across regional chain pools; canonical-tip records are CAS-committed via quorum_core into tip_lane."
+    },
+    {
+      "requirement_id": "IR-stale-pool-quorum-exclusion",
+      "explanation": "tip_quorum reads tip-stale set from tip_lane and excludes any tip-stale pool's vote from quorum computation; the exclusion is canonical because the tip-stale set is itself a quorum-committed lane entry."
+    },
+    {
+      "requirement_id": "IR-rollback-coherent",
+      "explanation": "tip_quorum CAS-commits rollback notifications keyed on globally-meaningful chain coordinates via quorum_core into tip_lane; every region's fanout reads the same coherent rollback through the lane."
+    },
+    {
+      "requirement_id": "IR-offboarding-teardown",
+      "explanation": "offboarding_orchestrator reads erasure tombstones from tombstone_lane and signals downstream parent components in the documented order with idempotency keys; collected attestations are CAS-committed via quorum_core into control_lane and the aggregate certificate (incl. complete-with-exceptions) is forwarded to metrics_store's compliance audit trail."
+    },
+    {
+      "requirement_id": "IR-quota-aggregation",
+      "explanation": "quota_aggregator receives sub-second per-(tenant, plan_version, tenant_cluster) deltas, maintains rolling aggregates committed via quorum_core into aggregate_lane, and proposes throttle-flag tombstones into tombstone_lane when ceilings are crossed; HLC bucketing comes from hlc_service."
+    },
+    {
+      "requirement_id": "IR-flag-fast-path",
+      "explanation": "flag_propagator watches tombstone_lane and writes flags to every region's auth_cache via the unified fast-path with documented per-region SLO; high-severity flags use deny-during-propagation pending markers and per-region flag-applied attestations land in control_lane via quorum_core."
+    },
+    {
+      "requirement_id": "IR-residency-policy-publish",
+      "explanation": "residency_publisher commits versioned residency policies via quorum_core into control_lane (with effective-from HLC stamps and two-phase activation for tightening) and pushes new versions to consumers; consumers pin and propagate the version they enforced."
+    },
+    {
+      "requirement_id": "IR-hlc-distribution",
+      "explanation": "hlc_service exchanges HLC samples out-of-band over the cert-bearing inter-region channel (consensus needs HLC, so the dependency is not inverted); samples beyond max-allowed-delta are discarded; local HLC is computed from a multi-peer median (N >= 3); a region failing to agree within window is forced into the parent-defined skew-degraded mode."
+    },
+    {
+      "requirement_id": "SR1-partition-degraded-read",
+      "explanation": "quorum_core's redefinition: 'on network partition, minority-region quorum_core replicas serve reads from locally-applied lane state with a partition-stale freshness annotation'."
+    },
+    {
+      "requirement_id": "SR1-partition-proposal-reject",
+      "explanation": "quorum_core's redefinition: 'minority-region quorum_core replicas reject proposals fast with a retryable-on-quorum-region signal'."
+    },
+    {
+      "requirement_id": "SR1-partition-input-buffer",
+      "explanation": "quorum_core's redefinition: 'bounded-watermark input buffers absorb non-discardable inputs (overflow: drop-with-loss-attestation for low-severity, alert-escalation for high-severity)'; the policy is also in quota_aggregator and tip_quorum redefinitions for their input streams."
+    },
+    {
+      "requirement_id": "SR1-partition-heal-replay",
+      "explanation": "quorum_core's redefinition: 'on heal, buffered work is replayed via quorum_core with idempotency keys so duplicates land but only commit once'; subservice redefinitions echo the idempotency-key replay behavior."
+    },
+    {
+      "requirement_id": "SR1-log-retention-classes",
+      "explanation": "Each lane node's definition declares its compaction policy: tombstone_lane retains full history through snapshots; tip_lane retains latest+bounded-reorg-window; aggregate_lane folds into per-period summaries; control_lane retains rotation events post-completion and attestations until forwarded."
+    },
+    {
+      "requirement_id": "SR1-log-snapshot-truncate",
+      "explanation": "quorum_core's redefinition: 'snapshot+truncate at watermark intervals; replicas catch up via snapshot transfer plus log-tail rather than full-log replay'."
+    },
+    {
+      "requirement_id": "SR1-log-tombstone-history",
+      "explanation": "tombstone_lane's definition: 'tombstone history is retained in full through snapshots so revocation semantics survive compaction'."
+    },
+    {
+      "requirement_id": "SR1-write-class-lanes",
+      "explanation": "Four lane nodes (tombstone_lane, tip_lane, aggregate_lane, control_lane) are explicit Log-typed nodes; quorum_core's definition states 'reserved consensus throughput per lane and head-of-line blocking is contained within a lane'."
+    },
+    {
+      "requirement_id": "SR1-tombstone-lane-slo",
+      "explanation": "tombstone_lane's definition: 'documented end-to-end commit-latency SLO (the unified fast-path SLO), monitored independently of bulk throughput'."
+    },
+    {
+      "requirement_id": "SR1-cross-lane-ordering",
+      "explanation": "Each lane's definition states entries 'carry HLC stamps'; quorum_core's CAS proposals attach HLC, so consumers reconstruct happens-before across lanes via HLC."
+    },
+    {
+      "requirement_id": "SR1-tip-source-rate-limit",
+      "explanation": "tip_quorum's redefinition: 'per-source rate limits drop excess submissions and flag the source'."
+    },
+    {
+      "requirement_id": "SR1-fork-admission-threshold",
+      "explanation": "tip_quorum's redefinition: '(chain, fork_id) candidate admission requires N independent regional observations across a documented window before the fork_id is committed to tip_lane; below threshold the candidate is held in a probationary set'."
+    },
+    {
+      "requirement_id": "SR1-tip-source-quarantine",
+      "explanation": "tip_quorum's redefinition: 'quarantines sources that violate per-source rate or cross-source-correlation rules; quarantines surface as alerts and exclude the quarantined source from quorum'."
+    },
+    {
+      "requirement_id": "SR1-hlc-bounded-sample",
+      "explanation": "hlc_service's redefinition: 'samples beyond max-allowed-delta are discarded and the source flagged but does not advance the local clock'."
+    },
+    {
+      "requirement_id": "SR1-hlc-multi-peer-consensus",
+      "explanation": "hlc_service's redefinition: 'local HLC is computed from a multi-peer median (N >= 3 peer samples)'."
+    },
+    {
+      "requirement_id": "SR1-hlc-auto-degraded",
+      "explanation": "hlc_service's redefinition: 'a region failing to agree with multi-peer median within max-allowed-delta for a documented window is automatically forced into the parent-defined skew-degraded mode and stops accepting writes that depend on time-bucketed enforcement'."
+    },
+    {
+      "requirement_id": "SR1-attestation-timeout",
+      "explanation": "offboarding_orchestrator's redefinition: 'each component has a documented attestation SLO; on timeout, offboarding_orchestrator records a best-effort attestation with evidence and escalation owner instead of waiting indefinitely'."
+    },
+    {
+      "requirement_id": "SR1-complete-with-exceptions",
+      "explanation": "offboarding_orchestrator's redefinition: 'aggregate certificate of deletion is issued in complete-with-exceptions state when every component has either a timely attestation or a recorded best-effort attestation; exceptions tracked in a separate exception register on control_lane with their own SLA'."
+    },
+    {
+      "requirement_id": "SR1-erasure-preservation-precedence",
+      "explanation": "offboarding_orchestrator's redefinition: 'where a preservation hold covers a data class, the affected component returns a preservation-blocked attestation with the hold reference — a recognized terminal state'."
+    },
+    {
+      "requirement_id": "SR1-rotation-cas-admission",
+      "explanation": "lifecycle_gate's redefinition: 'CAS proposals attach the latest read of (per-(chain, fork) quorum-size set, rotation-in-progress set, tip-stale set, schema-capability config, drain-in-progress set) as the precondition; commit re-validates atomically'. quorum_core's redefinition supports CAS commit semantics."
+    },
+    {
+      "requirement_id": "SR1-rotation-precondition-revalidate",
+      "explanation": "lifecycle_gate's redefinition: 'commit re-validates atomically; if rejected, lifecycle_gate re-reads latest applied state and re-proposes with refreshed preconditions'."
+    },
+    {
+      "requirement_id": "SR1-residency-versioned",
+      "explanation": "residency_publisher's redefinition: 'each tenant's residency policy carries explicit version + effective-from HLC stamp; consumers pin and propagate the version they enforced'."
+    },
+    {
+      "requirement_id": "SR1-residency-two-phase-tightening",
+      "explanation": "residency_publisher's redefinition: 'tightening changes use a two-phase apply: phase 1 commits the new version with effective-from in the future (push-and-acknowledge window), phase 2 activates the version; activation is globally-ordered via HLC'."
+    },
+    {
+      "requirement_id": "SR1-residency-deny-default",
+      "explanation": "residency_publisher's redefinition: 'consumers that fail to acknowledge readiness within the push-and-acknowledge window default to deny-by-default for the affected tenant'."
+    },
+    {
+      "requirement_id": "SR1-schema-tagged-entries",
+      "explanation": "Each lane definition states entries 'carry HLC stamps and schema_version tags'; quorum_core's redefinition: 'entries are tagged with schema_version'."
+    },
+    {
+      "requirement_id": "SR1-schema-capability-negotiation",
+      "explanation": "quorum_core's redefinition: 'admission of a new schema_version is itself a quorum-committed capability config entry into control_lane — leaders restrict writes to the previous schema_version until that config commits'."
+    },
+    {
+      "requirement_id": "SR1-schema-rollout-gated",
+      "explanation": "lifecycle_gate's redefinition: 'schema-version capability bumps are admitted only after every replica is confirmed at the new code version — a two-phase upgrade: deploy, then activate'; rollout itself is region-staggered like cert rotation under lifecycle_gate."
+    },
+    {
+      "requirement_id": "SR1-region-drain-event",
+      "explanation": "lifecycle_gate's redefinition: 'region-drain events are a first-class lifecycle event distinct from pool rotation, scheduled and admitted through the same CAS proposal mechanism'."
+    },
+    {
+      "requirement_id": "SR1-drain-aware-threshold",
+      "explanation": "lifecycle_gate's redefinition: 'quorum-size threshold is computed drain-aware: rotations are not blocked merely because a drain is in flight, but rotations whose admission would drop the post-drain quorum below safe are rejected'."
+    },
+    {
+      "requirement_id": "SR1-mutual-scheduling",
+      "explanation": "lifecycle_gate's redefinition: 'at most one region-drain plus one pool-rotation are in flight globally; mutual scheduling is enforced'."
+    },
+    {
+      "requirement_id": "SR1-fast-path-slo",
+      "explanation": "flag_propagator's redefinition: 'documented per-region delivery SLO monitored independently of bulk propagation rate; SLO breach raises an alert'."
+    },
+    {
+      "requirement_id": "SR1-deny-during-propagation",
+      "explanation": "flag_propagator's redefinition: 'for high-severity flags (cluster-suspended, key-revocation, erasure-tombstone), publishes a deny-during-propagation pending-marker to every region's auth_cache before the per-region apply lands'."
+    },
+    {
+      "requirement_id": "SR1-flag-applied-attestation",
+      "explanation": "flag_propagator's redefinition: 'per-region apply produces a flag-applied attestation written back through quorum_core into control_lane; a flag is globally-active only after attestations from every region land; lagging regions surface as alerts'."
+    },
+    {
+      "requirement_id": "SR1-idempotency-keys",
+      "explanation": "offboarding_orchestrator's redefinition: 'each signal carries an idempotency key (offboarding_id, component_id, attempt_id) committed via quorum_core into tombstone_lane so the canonical signal record survives leader change'."
+    },
+    {
+      "requirement_id": "SR1-attestation-dedup",
+      "explanation": "offboarding_orchestrator's redefinition: 'incoming attestations are deduped by idempotency key before aggregating into the certificate of deletion'."
+    },
+    {
+      "requirement_id": "SR2-cas-backoff",
+      "explanation": "quorum_core definition now distinguishes 'precondition-violation' from 'leader-change' rejection codes and states 'proposers apply exponential backoff with jitter on either, and treat leader-change as transient rather than immediately re-proposing with stale preconditions'."
+    },
+    {
+      "requirement_id": "SR2-cas-admission",
+      "explanation": "quorum_core definition now states it 'enforces a per-proposer in-flight CAS budget and a global CAS admission rate so a thrashing proposer cannot saturate consensus throughput; over-budget proposals are rejected fast with a retryable-with-backoff signal'."
+    },
+    {
+      "requirement_id": "SR2-snapshot-atomic-install",
+      "explanation": "quorum_core definition now states 'Snapshot install on a replica is atomic via an intent-then-commit protocol: the replica writes a snapshot-installing intent marker before any state mutation, replaces state files, then writes a snapshot-commit marker; on restart, an intent without matching commit forces full discard of partial snapshot state and re-fetch from quorum'."
+    },
+    {
+      "requirement_id": "SR2-needs-snapshot-state",
+      "explanation": "quorum_core definition now states 'A replica with an in-progress or failed snapshot install enters a NEEDS_SNAPSHOT state visible to the quorum: it does not vote, does not serve reads (including partition-stale reads), and does not count toward the quorum-size threshold until snapshot install commits and log-tail catch-up completes'."
+    },
+    {
+      "requirement_id": "SR2-hlc-stamp-validated",
+      "explanation": "quorum_core definition now states 'Every lane entry carries an HLC stamp captured at write time; quorum_core validates the stamp at commit time and rejects entries whose stamp is missing or beyond max-allowed-delta from the current HLC, so lane consumers can rely on stamps for cross-lane happens-before reconstruction'."
+    },
+    {
+      "requirement_id": "SR2-hlc-degraded-interlock",
+      "explanation": "quorum_core definition now states 'While the leader's hlc_service is in skew-degraded mode, quorum_core suspends admission of entry kinds that participate in security-critical cross-lane happens-before reconstruction (revocation-then-attestation, erasure-tombstone-then-offboarding-attestation, fast-path flag-applied attestations); other admissions carry an HLC-degraded annotation visible to consumers'."
+    },
+    {
+      "requirement_id": "SR2-pending-marker-rate-limit",
+      "explanation": "flag_propagator definition now states 'enforces a per-target_identity rate limit on pending-marker publication. Pending-markers beyond the rate are dropped with a metric and the originating proposer is flagged; the per-target_identity rate limit is independent of the unified fast-path's per-region delivery SLO so DoS attempts via pending-markers cannot also starve legitimate flag delivery'."
+    },
+    {
+      "requirement_id": "SR2-pending-marker-bound",
+      "explanation": "flag_propagator definition now states 'Pending-markers carry an originating-proposal-id and an HLC expiry bound; flag_propagator rejects any pending-marker publication that is not tied to an in-flight or committed tombstone proposal in tombstone_lane' and 'On HLC expiry the marker auto-clears in auth_cache without explicit retraction, so a stalled or rejected proposal cannot indefinitely deny traffic'."
+    },
+    {
+      "requirement_id": "SR2-probationary-timeout",
+      "explanation": "tip_quorum definition now states 'A probationary (chain, fork_id) candidate that exceeds a documented max-probationary-window without reaching the N-region threshold surfaces an alert listing the observed-region-set and the absent-region-set so operators can correlate against ongoing region-drain or rotation events'."
+    },
+    {
+      "requirement_id": "SR2-region-distinct-admission",
+      "explanation": "tip_quorum definition now states '(chain, fork_id) candidate admission requires N independent observations across N distinct regions (not merely N distinct chain_router replicas in the same region); multiple replicas in the same region count once for the threshold so colluding replicas within a region cannot satisfy the threshold alone'."
+    },
+    {
+      "requirement_id": "SR2-set-level-correlation",
+      "explanation": "tip_quorum definition now states 'Source-quarantine rules include set-level cross-source correlation: a (chain, fork_id) candidate witnessed only by sources in suspicious correlation (synchronized timing, identical observation deltas, no other regional witness) is held probationary even when no single source violates per-source rate, and the correlated set is surfaced in alerts'."
+    },
+    {
+      "requirement_id": "SR2-probationary-override",
+      "explanation": "lifecycle_gate definition now states 'operator-override probationary-fork admissions (CAS proposals that admit a probationary (chain, fork_id) over the N-region threshold-shortfall, gated on the absent-region-set being explainable by current drain-in-progress or rotation-in-progress entries in control_lane; the override commits to tip_lane with operator attribution)'."
+    },
+    {
+      "requirement_id": "SR2-cert-overlap-window",
+      "explanation": "lifecycle_gate definition now states 'Cert rotations on the inter-region channel are admitted only when the remaining validity on the active cert exceeds a documented overlap budget; during the overlap, both old and new cert are trusted on the inter-region channel so consensus on the rotation itself rides the old cert while the new cert is distributed via control_lane, and trust handover to the new cert is atomic at the HLC effective-from stamp recorded with the rotation entry'."
+    },
+    {
+      "requirement_id": "SR2-cert-emergency-recovery",
+      "explanation": "lifecycle_gate definition now states 'If the overlap window is breached (no successful rotation committed before the active cert nears expiry), lifecycle_gate raises an emergency-cert-recovery event in control_lane and stops admitting any non-cert-rotation lifecycle events; recovery from total cert expiry is delegated to a parent-scope out-of-band bootstrap surface — region_coordinator alone cannot recover consensus over a channel whose only authenticator has expired'."
+    },
+    {
+      "requirement_id": "SR2-pause-event-class",
+      "explanation": "lifecycle_gate definition now states 'documented operational pauses (VM live migration and any successor pause classes — first-class lifecycle events with a recorded pause-window and the affected region(s))' admitted via the same CAS-into-control_lane mechanism as other lifecycle events."
+    },
+    {
+      "requirement_id": "SR2-pause-aware-hlc",
+      "explanation": "hlc_service definition now states 'hlc_service consults control_lane for pause-in-progress entries scoped to its region; while a pause-in-progress entry covers its region, sample-vs-median delta is evaluated against a wider pause-mode bound and the region does not auto-trip skew-degraded mode for delta excursions explainable by the pause. On pause-end, hlc_service re-syncs from multi-peer median and only then resumes normal max-allowed-delta enforcement'."
+    },
+    {
+      "requirement_id": "SR2-quota-pre-aggregation",
+      "explanation": "quota_aggregator definition now states 'Pre-aggregates incoming deltas in-memory by (tenant, plan_version, tenant_cluster, HLC bucket) before proposing to aggregate_lane, so consensus throughput on aggregate_lane scales with bucket count rather than raw delta arrival rate'."
+    },
+    {
+      "requirement_id": "SR2-quota-shed-by-class",
+      "explanation": "quota_aggregator definition now states 'When the pre-aggregation buffer exceeds a documented watermark, sheds by ceiling-proximity class: aggregates well under the per-plan ceiling are dropped first with a loss-attestation; aggregates near or crossing a ceiling retain admission priority into aggregate_lane so throttle-flag tombstones are not delayed by low-severity delta floods'."
+    },
+    {
+      "requirement_id": "SR2-component-outage-breaker",
+      "explanation": "offboarding_orchestrator definition now states 'Tracks per-downstream-component best-effort-attestation rate; crossing a documented breaker threshold opens a component-outage state for that component: new offboarding signals are suspended, a component-outage alert is raised, and erasure tombstones whose data class would touch that component are held in a queued-pending-component-recovery state in tombstone_lane rather than rapidly accumulating best-effort attestations'."
+    },
+    {
+      "requirement_id": "SR2-queued-pending-class",
+      "explanation": "tombstone_lane definition now states it 'carries queued-pending-component-recovery entries for erasure tombstones whose downstream component is in an open component-outage breaker state (offboarding_orchestrator); the queued-pending entries drain via the normal offboarding flow once the breaker closes, and the queue is itself audited and alerted if its depth exceeds a documented bound'."
+    },
+    {
+      "requirement_id": "bubble-tip_quorum-1",
+      "explanation": "lifecycle_gate's redefinition adds the operator-override admission contract: every override CAS proposal must carry M-of-N signatures from distinct registered operator credentials drawn from region_coordinator's published roster, signatures are validated against the current roster version with HLC validity bounds, proposals signed by compromise-revoked credentials are rejected at admission, in-flight override proposals are CAS-invalidated before commit if any signer transitions into the compromise-revoked set, and signing operator identities are persisted into control_lane as a per-operator audit trail. tip_quorum's redefinition makes its operator-override path delegate credential validation to lifecycle_gate (single enforcement point), accepts overrides only when transited through lifecycle_gate's admission contract, and preserves operator-attribution end-to-end. Together they realize the parent-scope operator-credential authorization model (M-of-N, rotation, compromise-revocation, per-operator audit) so a single compromised credential cannot issue override admissions."
+    },
+    {
+      "requirement_id": "r-zoom-rc-residency-2pc",
+      "explanation": "residency_publisher redefined: PREPARE binds prepared-V+1 to per-tenant quarantine-and-relocate-complete-ack from tenant_store; COMMIT activates V+1 via M-of-regions quorum-witnessed CAS re-validating prepared-ack and per-region ack-quorum; ABORT idempotent on (tenant_key, V+1, attempt_id); PREPARED-ORPHAN on prepared-window expiry. Activation, prepared-ack, abort, prepared-orphan write typed entries via compliance_audit_owner."
+    },
+    {
+      "requirement_id": "r-zoom-rc-residency-prewarm",
+      "explanation": "residency_publisher redefined: pre-warm hydration channel rate-limited per-region; consumer ack-readies inline as part of registration; bounded queue depth, queue-overflow returns pre-warm-deferred causing deny-by-default for residency-pinned ops; honors monotonic-per-(consumer, instance_id, version) — fresh instance_id starts fresh ack history, same instance_id cannot regress."
+    },
+    {
+      "requirement_id": "r-zoom-rc-roster-2pc",
+      "explanation": "credential_roster definition: rotation-prepare commits prepared-V+1 entry to control_lane and broadcasts to override-admission consumers; rotation-activate is M-of-regions quorum-witnessed; consumers consult active roster_version on every commit; in-flight override proposals at activate-HLC cancel-by-roster-version atomically. Compromise-revocation carries retroactive-as-of-HLC; lifecycle_gate re-signs and re-broadcasts in-flight broadcasts whose emit-HLC >= retroactive-as-of-HLC."
+    },
+    {
+      "requirement_id": "r-zoom-rc-broadcast-self-contained",
+      "explanation": "lifecycle_gate redefined: drain-fence broadcasts carry the signing roster_version as part of the broadcast itself; consumers verify against the broadcast's NAMED roster_version; broadcasts remain verifiable for the duration of their HLC-bounded ack window even after a scheduled rotation activates a strictly newer version."
+    },
+    {
+      "requirement_id": "r-zoom-rc-drain-fence",
+      "explanation": "lifecycle_gate redefined: on observing erasure-tombstone in tombstone_lane for tenant T, computes fence_HLC f_T and broadcasts drain-fence-broadcast(T, f_T, signing roster_version); offboarding_orchestrator redefined to track per-(T, named-writer) ack state via durable phase markers."
+    },
+    {
+      "requirement_id": "r-zoom-rc-bounded-batching",
+      "explanation": "lifecycle_gate redefined: bulk-offboarding admitted into bounded waves with documented max-tenants-per-wave and inter-wave spacing; per-writer bounded ack queues with explicit back-pressure stall further wave admission; per-tenant HLC-bounded ack windows start from per-tenant ack-broadcast-emit-HLC, not from bulk operator action HLC."
+    },
+    {
+      "requirement_id": "r-zoom-rc-teardown-overlap",
+      "explanation": "lifecycle_gate redefined: node-teardown not admitted while any in-flight per-tenant drain-fence on that node is unacked; nodes that cannot flush within teardown window write durable drain-ack-handoff entry naming successor instance or persistent buffer; offboarding_orchestrator redefined to record drain-ack-handoff via control_lane and treat ack-by-handoff as ack."
+    },
+    {
+      "requirement_id": "r-zoom-rc-lease-issuance",
+      "explanation": "lease_issuer subsystem added: lease tokens issued via M-of-regions quorum-witnessed lease-prepared/lease-activated pattern committed via quorum_core to lease_lane; renewal under same lease_id with extended HLC TTL bound; force-revoke and lease-revoked entries; emergency re-bootstrap rooted in cert_bootstrap's OOB anchor under elevated M-of-N narrowly scoped."
+    },
+    {
+      "requirement_id": "r-zoom-rc-lease-handoff-fence",
+      "explanation": "lease_issuer definition: writes HLC-stamped handoff-fence entry to lease_lane, calls tenant_store's handoff-fence acknowledgement endpoint at parent, awaits ack, then commits lease-activated for lease_v_new. Ack audited via compliance_audit_owner."
+    },
+    {
+      "requirement_id": "r-zoom-rc-audit-key-destruction",
+      "explanation": "lifecycle_gate (PHASE A) computes fence_HLC f_T; writers ack at writer-local HLC >= f_T + skew_bound; (PHASE B) lifecycle_gate computes t_destroy = max(observed_ack_hlc, f_T + skew_bound) + write-delivery-grace and CAS-commits audit-key DESTROYED to lease_lane. compliance_audit_owner publishes write-delivery-grace bound and installs late-write-rejection cutoff at compliance_audit on DESTROYED commit; late writes rejected at admission and surfaced to protocol-violation log."
+    },
+    {
+      "requirement_id": "r-zoom-rc-health-freshness",
+      "explanation": "gateway_health_surface subsystem added: per-(region, Subrole) liveness samples with monotonic freshness signal; freshness window bounded by hlc_service skew_bound + inter-region propagation budget; routing-affecting classifications require cross-witness from at least two regions; single-region held probationary (classification_pending); stale-surface fallback documented at edge level."
+    },
+    {
+      "requirement_id": "r-zoom-rc-cert-bootstrap-anchor",
+      "explanation": "cert_bootstrap subsystem added: OOB trust anchor is M-of-N hardware-rooted material across distinct custodians; anchor-rotation procedure committed via quorum_core; anchor-availability-test cadence committed via control_lane; emergency cert recovery, roster-bootstrap, anchor rotation, emergency lease re-bootstrap under elevated M-of-N; every operation writes typed entry to compliance_audit via compliance_audit_owner."
+    },
+    {
+      "requirement_id": "r-zoom-rc-credential-roster-extracted",
+      "explanation": "credential_roster subsystem added; lifecycle_gate redefined to delegate credential validation to credential_roster's published roster (consulted via control_lane); residency_publisher's CAS proposals carry active roster_version; lease_issuer consults credential_roster on every commit; cold-start / post-full-revocation re-bootstrap rooted in cert_bootstrap."
+    },
+    {
+      "requirement_id": "r-zoom-rc-phase-markers",
+      "explanation": "offboarding_orchestrator redefined: maintains durable per-(offboarding_id, component_id) phase markers in control_lane progressing through RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL; never retracts emitted drain-ack; observed_ack_hlc for slowest writer consumed by lifecycle_gate PHASE B."
+    }
+  ]
+}

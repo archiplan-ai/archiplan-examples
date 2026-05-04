@@ -1,0 +1,264 @@
+{
+  "problem": "Мобильный кошелёк (не криптокошелёк), который позволяет пользователю расплачиваться в локальной фиатной валюте по QR-кодам торговцев в Тайланде (PromptPay/Thai QR), Вьетнаме (VietQR/NAPAS 247), Бразилии (Pix), а также по интероп-схемам (Alipay+/UPI и др.) в остальных странах. Пополнение баланса происходит депозитом USDT (TRC-20 на TRON): крипта мгновенно конвертируется в USD и зачисляется на единый USD-баланс пользователя — кошелёк сам криптовалюту не хранит. На момент платежа выполняется конверсия USD→локальный фиат с фиксацией курса. Подключение к локальным платёжным сетям — через лицензированных партнёров-эквайеров в каждой юрисдикции. Кошелёк проводит KYC до уровней, требуемых регулятором, и ведёт историю операций с чеками. P2P-переводы между пользователями вне scope. Стек намеренно абстрактен на уровне модели.",
+  "current_version": 1,
+  "versions": [
+    {
+      "id": 0,
+      "note": "Naive architecture: USDT→USD wallet, QR-платежи через локальных партнёров TH/VN/BR + кросс-бордер",
+      "from_session": null,
+      "created_at": "2026-04-29T11:24:42.291478+00:00"
+    },
+    {
+      "id": 1,
+      "note": "Iteration 1: VASP-роутинг, Travel Rule, AML, multi-partner с router/circuit-breaker, refund, risk, reconciliation, event_bus, fiscal receipts, depeg-monitor, FX-окно/margin",
+      "from_session": 1,
+      "created_at": "2026-04-29T11:41:02.703422+00:00"
+    }
+  ],
+  "stress_sessions": [
+    {
+      "id": 1,
+      "against_version": 0,
+      "produced_version": 1,
+      "stressors": [
+        {
+          "id": "S-bot-vasp",
+          "description": "Банк Таиланда (BoT) ужесточает регулирование VASP-провайдеров: для приёма USDT и его обмена на THB через эквайеров требуется локальная лицензия и физическое присутствие. Иностранный usdt_liquidity_partner и наша холдинговая структура без TH-лицензии теряют возможность участвовать в цепочке.",
+          "attractor": "Все TH-платежи останавливаются; пользователи в TH не могут пополняться или платить; конкуренты с локальной лицензией забирают рынок",
+          "breaking": true,
+          "solution": "Получаем (или партнёримся с) локально лицензированным VASP в Тайланде, который выполняет USDT→THB on-shore; deposit_service маршрутизирует TH-депозиты через th_vasp_partner; KYC уровни приводятся в соответствие с требованиями BoT для каждой юрисдикции",
+          "derived_reqs": [
+            "R-vasp-jurisdiction",
+            "R-kyc-jurisdiction"
+          ],
+          "affects": [
+            "usdt_liquidity_partner",
+            "kyc_service",
+            "partner_th",
+            "deposit_service"
+          ]
+        },
+        {
+          "id": "S-travel-rule",
+          "description": "FATF Travel Rule распространяется на USDT-депозиты ≥: требуется передача и хранение PII отправителя и получателя, контрагентский VASP-каноническая идентификация, и блокировка переводов от/к unhosted-кошелькам без верификации.",
+          "attractor": "Депозиты выше порога замораживаются; ledger содержит юридически некорректные записи; регулятор штрафует или отзывает лицензию",
+          "breaking": true,
+          "solution": "Вводим travel_rule_service, который интегрируется с провайдером Travel Rule (например, TRP / Sumsub Travel Rule / Notabene) и блокирует/маркирует депозиты, для которых не получена originator-информация; ledger_service пишет originator/beneficiary метаданные в проводки",
+          "derived_reqs": [
+            "R-travel-rule",
+            "R-ledger-pii"
+          ],
+          "affects": [
+            "deposit_service",
+            "kyc_service",
+            "ledger_service",
+            "tron_node",
+            "usdt_liquidity_partner"
+          ]
+        },
+        {
+          "id": "S-liquidity-down",
+          "description": "Единственный usdt_liquidity_partner недоступен 2 часа из-за технического сбоя или резко расширяет спред (>1%) на фоне рыночного стресса. Депозиты не конвертируются, USDT накапливается на адресах кошелька.",
+          "attractor": "Депозиты застревают в pending; пользователи видят неверный баланс; кошелёк фактически становится держателем USDT, что нарушает наш не-крипто принцип",
+          "breaking": true,
+          "solution": "Подключаем нескольких usdt_liquidity_partner и вводим liquidity_router, который выбирает лучший курс/доступного партнёра по политике; добавляем USDT-pool как буфер на случай временной недоступности всех партнёров и алерты при превышении порога удержания крипты",
+          "derived_reqs": [
+            "R-liquidity-multi",
+            "R-usdt-buffer"
+          ],
+          "affects": [
+            "usdt_liquidity_partner",
+            "deposit_service",
+            "wallet_service",
+            "ledger_service"
+          ]
+        },
+        {
+          "id": "S-partner-outage",
+          "description": "partner_br пропал на 4 часа во время Black Friday: API возвращает 5xx или таймауты. Все Pix-платежи через payment_service провисают, ретраи накапливаются, пользователи дублируют попытки.",
+          "attractor": "Очередь pending-платежей; двойные списания при ретраях; пользователи теряют доверие; реверсы создают расхождения в ledger",
+          "breaking": true,
+          "solution": "Вводим вторичного partner_br_alt и payment_router с circuit-breaker и health-checks, который переключает трафик между Pix-эквайерами; добавляем idempotency_store для дедупликации платёжных намерений",
+          "derived_reqs": [
+            "R-partner-redundancy",
+            "R-payment-idempotency"
+          ],
+          "affects": [
+            "partner_br",
+            "payment_service",
+            "ledger_service"
+          ]
+        },
+        {
+          "id": "S-usdt-depeg",
+          "description": "USDT теряет привязку к доллару: торгуется по 0.94-0.97 USD сутки на фоне рыночной паники. Если кошелёк продолжает зачислять депозиты по номиналу 1:1, появляются убытки или, наоборот, пользователи получают незаслуженный профит при отскоке.",
+          "attractor": "Кошелёк либо несёт прямые убытки, либо ущемляет пользователей нечестным курсом; репутационная и финансовая яма",
+          "breaking": true,
+          "solution": "Депозиты конвертируются по реальному рыночному курсу USDT/USD от usdt_liquidity_partner на момент свопа, а не по номиналу 1:1; добавляем depeg_monitor, который при отклонении выше порога временно приостанавливает приём депозитов и уведомляет пользователя ожидаемым курсом перед подтверждением",
+          "derived_reqs": [
+            "R-usdt-real-rate",
+            "R-depeg-halt"
+          ],
+          "affects": [
+            "deposit_service",
+            "usdt_liquidity_partner",
+            "wallet_service",
+            "ledger_service"
+          ]
+        },
+        {
+          "id": "S-fx-slippage",
+          "description": "Между фиксацией FX-курса USD→локальная валюта в момент сканирования QR и фактическим подтверждением платежа торговцу проходит 30+ секунд (медленный партнёр), за это время курс ушёл больше чем на margin, который у нас заложен.",
+          "attractor": "Кошелёк несёт убытки, либо платежи отменяются, либо пользователь видит инфляцию суммы при подтверждении",
+          "breaking": true,
+          "solution": "Вводим явное окно удержания курса (например, 30 секунд) с margin поверх mid-rate; при истечении окна payment_service запрашивает свежую котировку и просит пользователя подтвердить заново; fx_service хеджирует open exposure через лимиты позиций по парам",
+          "derived_reqs": [
+            "R-fx-quote-window",
+            "R-fx-margin"
+          ],
+          "affects": [
+            "fx_service",
+            "payment_service",
+            "fx_provider"
+          ]
+        },
+        {
+          "id": "S-aml-dirty-usdt",
+          "description": "Депозит USDT приходит с адреса, фигурирующего в OFAC/UN-санкционных списках или связанного с микшерами/даркнет-маркетами. Без проверки on-chain происхождения мы зачисляем 'грязные' средства и нарушаем AML-законодательство всех трёх юрисдикций.",
+          "attractor": "Регулятор замораживает счета и накладывает штраф; партнёр-VASP отзывает интеграцию; репутационная катастрофа",
+          "breaking": true,
+          "solution": "Вводим chain_analytics (TRM/Chainalysis) и aml_screening_service: каждый входящий USDT прогоняется через скоринг до конверсии; высокорисковые депозиты карантинизируются и возвращаются на отправляющий адрес после ручной проверки",
+          "derived_reqs": [
+            "R-aml-screening",
+            "R-aml-quarantine"
+          ],
+          "affects": [
+            "deposit_service",
+            "kyc_service",
+            "ledger_service",
+            "tron_node"
+          ]
+        },
+        {
+          "id": "S-tron-reorg",
+          "description": "На TRON происходит реорг или временный split: транзакция, увиденная deposit_service как подтверждённая на 19 блоках, исчезает; USDT-депозит фактически отменён, но на USD-баланс пользователя уже зачислены средства.",
+          "attractor": "Двойной зачёт: пользователь тратит USD, а USDT возвращается; кошелёк теряет средства; реверсы вручную трудоёмки",
+          "breaking": true,
+          "solution": "deposit_service зачисляет USDT-депозит на USD-баланс только после порога безопасных подтверждений TRON (≥ 20 блоков, что покрывает SR-финализацию); pre-finality депозиты видимы пользователю как pending без возможности расходования",
+          "derived_reqs": [
+            "R-confirmations"
+          ],
+          "affects": [
+            "deposit_service",
+            "tron_node",
+            "wallet_service",
+            "ledger_service"
+          ]
+        },
+        {
+          "id": "S-merchant-refund",
+          "description": "Тайский торговец делает refund после оплаты (товар отсутствует) или бразильский Pix initiates MED (Mecanismo Especial de Devolução) для возврата спорной транзакции. Возврат приходит на наш счёт у партнёра-эквайера, но в наивной архитектуре нет ни обратной FX-конверсии, ни кредита на USD-баланс пользователя.",
+          "attractor": "Деньги застревают между нами и партнёром; пользователь не получает возврат на USD-баланс; жалобы и регуляторные обращения",
+          "breaking": true,
+          "solution": "Вводим refund_service, который слушает события возврата от партнёров, выполняет обратную FX-конвертацию по rate-at-refund (или original в зависимости от партнёра/правил), кредитует USD-баланс пользователя и пишет реверсные проводки в ledger",
+          "derived_reqs": [
+            "R-refund"
+          ],
+          "affects": [
+            "payment_service",
+            "partner_th",
+            "partner_br",
+            "ledger_service",
+            "wallet_service"
+          ]
+        },
+        {
+          "id": "S-account-takeover",
+          "description": "Аккаунт пользователя скомпрометирован (фишинг credentials или SIM swap). Атакующий заходит в кошелёк, инициирует платёж себе на подконтрольный QR-код в Бразилии или TH, и средства уходят необратимо до того, как настоящий пользователь замечает.",
+          "attractor": "Массовые потери средств пользователей; невозможность возврата (платежи через PromptPay/Pix необратимы); регуляторные предписания и иски",
+          "breaking": true,
+          "solution": "Вводим risk_service с поведенческим скорингом каждого платежного намерения; крупные/нестандартные транзакции требуют step-up подтверждения (биометрия + push-confirmation на доверенном устройстве); cooling-off период для впервые добавленных получателей; device_trust учитывается auth_service",
+          "derived_reqs": [
+            "R-risk-scoring",
+            "R-step-up-auth"
+          ],
+          "affects": [
+            "auth_service",
+            "payment_service",
+            "kyc_service"
+          ]
+        },
+        {
+          "id": "S-reconciliation-drift",
+          "description": "В конце каждого операционного дня каждый партнёр-эквайер (PromptPay/VietQR/Pix/global) публикует settlement-отчёт: какие платежи реально прошли, в каких суммах, с какими комиссиями. Без автоматической сверки расхождения копятся: партнёр зачислил 1.234M THB, ledger ожидает 1.235M — разница в 1k THB растёт каждую неделю.",
+          "attractor": "Бухгалтерия теряет контроль; невозможно подготовить финансовую отчётность; на аудите не сходится; регулятор замораживает операции",
+          "breaking": true,
+          "solution": "Вводим reconciliation_service, который ежедневно забирает settlement-отчёты от каждого партнёра, сверяет их с ledger по идемпотентному ключу платежа, поднимает алерты на расхождения и пишет корректирующие проводки после операторского approve",
+          "derived_reqs": [
+            "R-reconciliation"
+          ],
+          "affects": [
+            "payment_service",
+            "ledger_service",
+            "partner_th",
+            "partner_vn",
+            "partner_br",
+            "partner_global"
+          ]
+        },
+        {
+          "id": "S-promptpay-limits",
+          "description": "PromptPay имеет дневные/per-транзакционные лимиты у каждого банка-получателя торговца (например, до 2M THB/день per merchant tier). Платёж туриста выше лимита тихо отклоняется со стороны банка торговца, но в наивной архитектуре payment_service не знает про эти лимиты заранее и принимает QR.",
+          "attractor": "Платежи отклоняются партнёром после fixation курса; пользователь раздражён неожиданными отказами; курс уже зафиксирован — потеря FX-margin",
+          "breaking": true,
+          "solution": "Вводим limit-aware маршрутизацию в payment_service: до фиксации курса проверяем известные лимиты схемы и tier мерчанта (если партнёр публикует), при превышении предлагаем пользователю выбор разделения платежа или отмены; payment_service хранит decoded_qr с merchant context для последующей обработки",
+          "derived_reqs": [
+            "R-scheme-limits"
+          ],
+          "affects": [
+            "payment_service",
+            "partner_th"
+          ]
+        },
+        {
+          "id": "S-load-spike",
+          "description": "Маркетинговый запуск даёт пик: 50k одновременных депозитов и 200k QR-сканирований в час. wallet_service и ledger_service — точки сериализации (одна БД, write-heavy), очереди забиваются, latency взлетает до минут, часть платежей таймаутит.",
+          "attractor": "Деградация UX в момент когда пользователи особенно внимательны; провал маркетинга; пользователи уходят и оставляют негативные отзывы",
+          "breaking": true,
+          "solution": "Вводим event_bus (асинхронная шина) для off-loading побочных эффектов (запись в ledger, audit, нотификации); шардируем wallet_db и ledger_db по user_id; payment_service и deposit_service пишут платёжное намерение в очередь и возвращают pending пользователю; CQRS-разделение read/write на ledger",
+          "derived_reqs": [
+            "R-async-fanout",
+            "R-shard-by-user"
+          ],
+          "affects": [
+            "wallet_service",
+            "ledger_service",
+            "wallet_db",
+            "ledger_db",
+            "payment_service",
+            "deposit_service"
+          ]
+        },
+        {
+          "id": "S-tax-receipts",
+          "description": "Бразильское налоговое законодательство требует выдачи NF-e (электронной фискальной накладной) при определённых типах операций; Тайланд требует VAT-receipt от резидентов с определённым оборотом; Вьетнам требует e-invoice (hóa đơn điện tử). Универсальный 'чек' из ledger не удовлетворяет ни одной из локальных фискальных схем.",
+          "attractor": "Пользователи-предприниматели не могут использовать кошелёк для бизнес-расходов; жалобы регулятору; легальные риски от неправильно оформленных квитанций",
+          "breaking": true,
+          "solution": "Вводим receipt_service, который генерирует чеки в формате, требуемом юрисдикцией: NF-e для BR, VAT-чек для TH, e-invoice для VN; формат и нумерация определяются по стране транзакции; через интеграцию с локальным fiscal-провайдером (или партнёром-эквайером, если он покрывает)",
+          "derived_reqs": [
+            "R-fiscal-receipts"
+          ],
+          "affects": [
+            "ledger_service",
+            "partner_th",
+            "partner_vn",
+            "partner_br"
+          ]
+        }
+      ]
+    }
+  ],
+  "active_session": null,
+  "schema_version": 2,
+  "needs_affects_backfill": []
+}
