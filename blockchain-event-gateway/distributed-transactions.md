@@ -41,7 +41,7 @@ sequenceDiagram
         TS->>TS: PREPARED-ORPHAN degraded mode
         TS->>CA: typed prepared-orphan entry
         TS->>RP: alarm lifecycle_gate
-        Note over TS: refuses further V+1 prepares;<br/>recovery requires M-of-N operator action
+        Note over TS: refuses further V+1 prepares,<br/>recovery requires M-of-N operator action
     else abort path
         RP->>Q: ABORT CAS with monotonic abort_id
         Q-->>RP: M-of-regions witnessed
@@ -262,7 +262,7 @@ sequenceDiagram
         end
     end
 
-    Note over LG,W: bulk-offboarding admitted in bounded waves<br/>with explicit per-writer back-pressure;<br/>per-tenant ack window starts at per-tenant ack-broadcast-emit-HLC,<br/>not bulk action HLC
+    Note over LG,W: bulk-offboarding admitted in bounded waves<br/>with explicit per-writer back-pressure<br/>per-tenant ack window starts at per-tenant ack-broadcast-emit-HLC,<br/>not bulk action HLC
 ```
 
 **Annotated steps**
@@ -458,7 +458,7 @@ sequenceDiagram
     participant OOB as OOB anchor<br/>(M-of-N hardware-rooted custodians,<br/>geographically + organizationally distinct)
     participant CA as compliance_audit
 
-    Note over CB: triggered when inter-region channel cert<br/>has expired or is unavailable;<br/>consensus over channel impossible
+    Note over CB: triggered when inter-region channel cert<br/>has expired or is unavailable,<br/>consensus over channel impossible
 
     Ops->>CB: human authorization (M-of-N, elevated threshold)
     CB->>OOB: cert re-rooting request
@@ -520,7 +520,7 @@ sequenceDiagram
         TS->>CA: certificate-of-deletion (erasure-incomplete)
     end
 
-    Note over CA: each component carries provenance —<br/>which writer, which lease/policy_version, which broadcast HLC.<br/>Certificate vouches for Tier-2 witnesses;<br/>post-shred regulators verify hash chain + Tier-2 commitments.
+    Note over CA: each component carries provenance —<br/>which writer, which lease/policy_version, which broadcast HLC.<br/>Certificate vouches for Tier-2 witnesses,<br/>post-shred regulators verify hash chain + Tier-2 commitments.
 ```
 
 **Annotated steps**
