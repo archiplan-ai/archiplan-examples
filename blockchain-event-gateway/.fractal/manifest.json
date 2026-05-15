@@ -1,6 +1,6 @@
 {
   "problem": "Provide a multi-tenant API service that gives developers programmatic read access to on-chain data across Ethereum mainnet, Sepolia testnet, Bitcoin, and Cardano. The service exposes each chain's native JSON-RPC interface (passthrough), serves both current and historical/archive state, and pushes real-time chain events — new block headers, mempool/pending transactions (incl. Cardano via Ogmios local-tx-monitor), and watched-address activity — to clients over websockets. The service must deliver reorg-safe semantics (rollback notifications, finality), authenticate every request to a tenant via API key, and enforce per-key rate limits and quotas.",
-  "current_version": 10,
+  "current_version": 11,
   "versions": [
     {
       "id": 0,
@@ -67,6 +67,12 @@
       "note": "v10 — Direction 20: Root Session 6 absorbed D18 chain_router bubbles. region_coordinator subsystem 6 (credential_roster) extended with on-demand named-roster lookup endpoint over the cert-bearing inter-region surface (documented serving-plane availability target, per-caller/per-region rate limits, bulk-wave-coalesced fetch under HLC-bounded budget tighter than per-tenant drain-fence ack window, lifecycle-gate-signed responses, read-only and outside the 2PC rotation flow), unblocking s2-named-roster-unknown-locally and s2-stale-roster-cache-during-bulk-offboarding inside chain_router. region_coordinator subsystem 8 (gateway_health_surface) extended to surface fork-transition-pending per (chain, fork). fanout root-level redefinition pins minimal fork-transition handshake-ack contract: durable per-(region, chain, fork-pair) ack of divergence point before chain_router admits forward-progress dispatch on the new fork; per-cursor monotonicity guarantee across the rollback-then-forward-progress sequence (rollback-event cursor < divergence-point cursor < first new-fork forward-progress cursor, no replay under handshake retry); fork-transition-pending visibility on gateway_health_surface; internal subscription rollback-and-rebind state machine explicitly deferred to a future fanout zoom (Direction 22 candidate). fanout drain-fence consumption updated to call the named-roster lookup endpoint on cache miss. No nodes/types/edges added; both bubbles satisfied via --redefine alone. No stress session run — constraint allows skip when redefinitions close both bubbles cleanly.",
       "from_session": null,
       "created_at": "2026-05-04T12:19:02.595294+00:00"
+    },
+    {
+      "id": 11,
+      "note": "v11 — Definition cleanup: lifted embedded functional requirements out of all 17 root-node definitions. Every clause was already covered by existing root-scope reqs (no new reqs needed). All defs now ≤240 chars, single identity sentence, no modal verbs. K̄/P̄/regime unchanged — pure prose cleanup, no structural change.",
+      "from_session": null,
+      "created_at": "2026-05-15T17:19:54.968156+00:00"
     }
   ],
   "stress_sessions": [
@@ -1142,5 +1148,6 @@
   ],
   "active_session": null,
   "schema_version": 2,
-  "needs_affects_backfill": []
+  "needs_affects_backfill": [],
+  "decision_id_high_watermark": 0
 }

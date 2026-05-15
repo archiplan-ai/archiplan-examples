@@ -3,14 +3,12 @@
     {
       "name": "Subservice",
       "definition": "Internal control-plane subservice running as part of chain_router; holds no canonical state outside chain_router's stores; mutations are local but coordinate over region_coordinator for cross-region truths.",
-      "layer": "epistatic",
-      "aspects": []
+      "layer": "epistatic"
     },
     {
       "name": "StateSet",
       "definition": "Local in-process state set or table maintained by a chain_router subservice; canonical only within this region's chain_router instance, not globally.",
-      "layer": "epistatic",
-      "aspects": []
+      "layer": "epistatic"
     }
   ],
   "edge_types": [
@@ -49,62 +47,52 @@
     {
       "id": "sub_pool_fork_partitioner",
       "node_type": "Subservice",
-      "definition": "Front door for incoming RPCs into chain_router: reads the request's (chain, fork) tag and routes it to the per-fork sub-pool, refusing requests that name an unknown or quarantined (chain, fork_id) with a documented error code so requests cannot fall through to a default sub-pool. Maintains a routing table keyed by (chain, fork_id) -> sub-pool that is rebuilt whenever pool_registry transitions a sub-pool's state; the routing table carries the hlc_stamp at which it was rebuilt and refuses to dispatch requests whose lookup pre-dates a fork-transition stamp affecting the target sub-pool — instead the request is bounced to be re-routed against the latest table. Routing also consumes the request's cost-class hint (short-RPC tip-sensitive vs long-RPC archive) and routes only to a replica whose replica-class (read from pool_registry's per-(chain, fork_id) shard) includes the request's class. Per-replica fan-out within a sub-pool uses the effective-capacity denominator (count of replicas currently admitted AND not draining AND not in deferred-quarantine AND not tip-stale) propagated from pool_membership_manager rather than raw pool_registry membership. COST-CLASS HINT PRESERVATION: attaches the original cost-class hint to every retryable-on-other-replica response so the retry path (whether through gateway or internal pool_membership_manager re-dispatch) preserves it. FORK-TRANSITION HANDSHAKE TO FANOUT: when fork_detection_alerter declares a sub-pool repartition for (chain, fork_id) and pool_membership_manager has committed the new sub-pool's membership, sub_pool_fork_partitioner emits a structured fork-transition handshake to fanout naming the divergence point (chain_id, prior fork_id, new fork_id, divergence height/HLC, prior fork's terminal HLC observed by chain_router); admits forward-progress dispatch on the new fork_id ONLY after a fanout-handshake-ack is recorded in pool_registry's per-(chain, fork_id) shard with the divergence-point HLC. Until the ack is recorded, requests tagged with the new fork_id are bounced (retryable-on-other-region-or-later-time). Handshake timeout exceeding a documented bound surfaces fork-transition-stalled alert; sub_pool_fork_partitioner never unilaterally unblocks dispatch. FORK-TRANSITION-PENDING DEGRADED MODE: when fanout's handshake-ack is unavailable (fanout-suspended in region per gateway_health_surface), sub_pool_fork_partitioner enters a documented fork-transition-pending degraded mode for the affected (chain, fork_id) — refuses dispatch tagged with the new fork_id with a typed 'fork-transition-pending' error so callers can retry against another region or wait, and the degraded state is observable on the gateway_health_surface so edge-side residency-aware routing can shift traffic; chain_router NEVER dispatches forward-progress on the new fork without a fanout ack.",
-      "aspects": []
+      "definition": "Front door for incoming RPCs into chain_router: reads the request's (chain, fork) tag and routes it to the per-fork sub-pool, refusing requests that name an unknown or quarantined (chain, fork_id) with a documented error code so requests cannot fall through to a default sub-pool. Maintains a routing table keyed by (chain, fork_id) -> sub-pool that is rebuilt whenever pool_registry transitions a sub-pool's state; the routing table carries the hlc_stamp at which it was rebuilt and refuses to dispatch requests whose lookup pre-dates a fork-transition stamp affecting the target sub-pool — instead the request is bounced to be re-routed against the latest table. Routing also consumes the request's cost-class hint (short-RPC tip-sensitive vs long-RPC archive) and routes only to a replica whose replica-class (read from pool_registry's per-(chain, fork_id) shard) includes the request's class. Per-replica fan-out within a sub-pool uses the effective-capacity denominator (count of replicas currently admitted AND not draining AND not in deferred-quarantine AND not tip-stale) propagated from pool_membership_manager rather than raw pool_registry membership. COST-CLASS HINT PRESERVATION: attaches the original cost-class hint to every retryable-on-other-replica response so the retry path (whether through gateway or internal pool_membership_manager re-dispatch) preserves it. FORK-TRANSITION HANDSHAKE TO FANOUT: when fork_detection_alerter declares a sub-pool repartition for (chain, fork_id) and pool_membership_manager has committed the new sub-pool's membership, sub_pool_fork_partitioner emits a structured fork-transition handshake to fanout naming the divergence point (chain_id, prior fork_id, new fork_id, divergence height/HLC, prior fork's terminal HLC observed by chain_router); admits forward-progress dispatch on the new fork_id ONLY after a fanout-handshake-ack is recorded in pool_registry's per-(chain, fork_id) shard with the divergence-point HLC. Until the ack is recorded, requests tagged with the new fork_id are bounced (retryable-on-other-region-or-later-time). Handshake timeout exceeding a documented bound surfaces fork-transition-stalled alert; sub_pool_fork_partitioner never unilaterally unblocks dispatch. FORK-TRANSITION-PENDING DEGRADED MODE: when fanout's handshake-ack is unavailable (fanout-suspended in region per gateway_health_surface), sub_pool_fork_partitioner enters a documented fork-transition-pending degraded mode for the affected (chain, fork_id) — refuses dispatch tagged with the new fork_id with a typed 'fork-transition-pending' error so callers can retry against another region or wait, and the degraded state is observable on the gateway_health_surface so edge-side residency-aware routing can shift traffic; chain_router NEVER dispatches forward-progress on the new fork without a fanout ack."
     },
     {
       "id": "pool_membership_manager",
       "node_type": "Subservice",
-      "definition": "Owns admit/evict decisions for chain pool replicas across all (chain, fork_id) sub-pools: replicas are admitted into a sub-pool, transitioned through healthy/draining/evicted/quarantined lifecycle states, and the per-(chain, fork_id) sub-pool membership is the canonical source for which replicas serve traffic in this region. Lifecycle transitions in pool_registry are gated on the replica's current drain_state_log entry: admit requires drain-completed-or-aborted, evict requires drain-completed; concurrent proposals are CAS-ordered through pool_registry per shard so admit-during-drain or evict-after-readmit cannot both commit. Re-admission of a draining replica requires an explicit drain-abort transition before admit can commit; auto-admit cannot transition a replica with drain_state_log = drain-in-progress without first proposing drain-abort, surfacing an alert with attribution. On dispatch the manager re-validates the replica's currently-recorded fork_id against the request's (chain, fork_id) tag at the moment of dispatch (not just at routing-table read time); a mismatch returns a retryable-on-other-replica signal. Refuses any quarantine eviction whose commit would push the (chain, fork_id) sub-pool's healthy-replica count below the documented safe-membership floor; refusal surfaces an alert with the (chain, fork_id) at risk. Computes the effective-capacity denominator (count of replicas currently admitted AND not draining AND not in deferred-quarantine AND not tip-stale) from per-(chain, fork_id) pool_registry shard summaries on every relevant transition and propagates it to sub_pool_fork_partitioner. Exposes a per-(chain, fork_id) target-capacity surface; when traffic share exceeds target by a documented margin, proposes membership rebalances gated on safe-membership floor for both source and destination sub-pools, committed via the same CAS path. Records per-replica replica-class (tip-serving / historical-archive / both) in pool_registry; refuses to admit a tip-class request to an archive-only replica and vice versa. COST-CLASS DISPATCH: refuses any dispatch lacking a cost-class hint when the request type requires one (long-RPC archive paths) and surfaces an alert if a cost-class-less retry arrives at dispatch (so a retry that lost its hint cannot be silently mis-routed). DRAIN-FENCE BROADCAST CONSUMER: pool_membership_manager (with drain_coordinator) consumes lifecycle_gate-originated drain-fence broadcasts for tenant T as self-contained credential bundles, verifies the signature against the broadcast's NAMED roster_version (via on-demand named-roster fetch from region_coordinator when V_named is strictly newer than the local cache, bounded by an HLC budget tighter than the per-tenant ack window; on fetch failure rejects with a typed 'named-roster-unfetchable' attestation to compliance_audit; bulk waves coalesce named-roster fetches into one). On verified broadcast, flushes in-flight audit writes for tenant T to compliance_audit then acks drain to tenant_store within the HLC-bounded ack window. PRIORITY LANE: drain-fence flush takes priority on the per-(chain, fork_id) pool_registry shard CAS line (tagged drain-fence-priority and pre-empts deferred-quarantine commits); deferred-quarantines wait until drain-fence ACK-EMITTED; surfaces an alert when quarantine deferral grows under drain-fence pressure. DRAIN-FENCE VS FORK-TRANSITION FENCE: refuses to commit a drain-ack while a fork-transition handshake is mid-flight on any (chain, fork_id) shard whose audit writes for tenant T are in flight; ack-window HLC budget extends across handshake completion or the broadcast is rejected with a typed 'drain-fence-blocked-by-fork-transition' attestation; flush enumerates audit writes by tenant_id across both pre- and post-transition sub-pool views. PHASE-MARKERS: maintains a durable per-(offboarding_id, component_id) apply-state record with typed phase-markers (RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL-ACK, TERMINAL-PRESERVATION-BLOCKED); on restart resumes from the last durable phase and never re-runs a non-idempotent phase; never retracts a drain-ack. TERMINAL-CLASS ATTESTATION: each terminal class writes exactly one typed attestation to compliance_audit under the (offboarding_id, component_id, attempt_id) idempotency key; canonical writer election by drain_state_log CAS shared with drain_coordinator. OPERATOR-OVERRIDE: operator-override admission (used during emergency rollover) requires M-of-N operator quorum signatures on the admit proposal — signing operators are recorded with the admit commit and visible in audit. ROSTER VERIFICATION: caches operator-credential roster locally with documented HLC-bounded freshness window; falls to deny-by-default for further override admissions when cached roster is older than the freshness window or no roster has ever been received; deny is sticky until a strictly-newer roster_version ack-readies. Override-commit path verifies the proposal against region_coordinator's currently-active roster_version (named-roster lookup, not local cache) at commit time, including evaluation of any retroactive-as-of-HLC compromise-revocation predating the proposal's submission HLC; commit fails closed if any signing credential is retroactively revoked; pre-commit roster_version is re-checked atomically with the pool_registry CAS commit so the activation race cannot slip between roster check and registry commit. Rejects proposals whose signing roster_version predates the currently-effective roster_version. Enforces a documented max-overrides-per-window rate limit on operator-override admissions that bypass safe-membership floor. Reads pool_registry through the per-(chain, fork_id) shard plus shard-level summaries for cross-shard consumers.",
-      "aspects": []
+      "definition": "Owns admit/evict decisions for chain pool replicas across all (chain, fork_id) sub-pools: replicas are admitted into a sub-pool, transitioned through healthy/draining/evicted/quarantined lifecycle states, and the per-(chain, fork_id) sub-pool membership is the canonical source for which replicas serve traffic in this region. Lifecycle transitions in pool_registry are gated on the replica's current drain_state_log entry: admit requires drain-completed-or-aborted, evict requires drain-completed; concurrent proposals are CAS-ordered through pool_registry per shard so admit-during-drain or evict-after-readmit cannot both commit. Re-admission of a draining replica requires an explicit drain-abort transition before admit can commit; auto-admit cannot transition a replica with drain_state_log = drain-in-progress without first proposing drain-abort, surfacing an alert with attribution. On dispatch the manager re-validates the replica's currently-recorded fork_id against the request's (chain, fork_id) tag at the moment of dispatch (not just at routing-table read time); a mismatch returns a retryable-on-other-replica signal. Refuses any quarantine eviction whose commit would push the (chain, fork_id) sub-pool's healthy-replica count below the documented safe-membership floor; refusal surfaces an alert with the (chain, fork_id) at risk. Computes the effective-capacity denominator (count of replicas currently admitted AND not draining AND not in deferred-quarantine AND not tip-stale) from per-(chain, fork_id) pool_registry shard summaries on every relevant transition and propagates it to sub_pool_fork_partitioner. Exposes a per-(chain, fork_id) target-capacity surface; when traffic share exceeds target by a documented margin, proposes membership rebalances gated on safe-membership floor for both source and destination sub-pools, committed via the same CAS path. Records per-replica replica-class (tip-serving / historical-archive / both) in pool_registry; refuses to admit a tip-class request to an archive-only replica and vice versa. COST-CLASS DISPATCH: refuses any dispatch lacking a cost-class hint when the request type requires one (long-RPC archive paths) and surfaces an alert if a cost-class-less retry arrives at dispatch (so a retry that lost its hint cannot be silently mis-routed). DRAIN-FENCE BROADCAST CONSUMER: pool_membership_manager (with drain_coordinator) consumes lifecycle_gate-originated drain-fence broadcasts for tenant T as self-contained credential bundles, verifies the signature against the broadcast's NAMED roster_version (via on-demand named-roster fetch from region_coordinator when V_named is strictly newer than the local cache, bounded by an HLC budget tighter than the per-tenant ack window; on fetch failure rejects with a typed 'named-roster-unfetchable' attestation to compliance_audit; bulk waves coalesce named-roster fetches into one). On verified broadcast, flushes in-flight audit writes for tenant T to compliance_audit then acks drain to tenant_store within the HLC-bounded ack window. PRIORITY LANE: drain-fence flush takes priority on the per-(chain, fork_id) pool_registry shard CAS line (tagged drain-fence-priority and pre-empts deferred-quarantine commits); deferred-quarantines wait until drain-fence ACK-EMITTED; surfaces an alert when quarantine deferral grows under drain-fence pressure. DRAIN-FENCE VS FORK-TRANSITION FENCE: refuses to commit a drain-ack while a fork-transition handshake is mid-flight on any (chain, fork_id) shard whose audit writes for tenant T are in flight; ack-window HLC budget extends across handshake completion or the broadcast is rejected with a typed 'drain-fence-blocked-by-fork-transition' attestation; flush enumerates audit writes by tenant_id across both pre- and post-transition sub-pool views. PHASE-MARKERS: maintains a durable per-(offboarding_id, component_id) apply-state record with typed phase-markers (RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL-ACK, TERMINAL-PRESERVATION-BLOCKED); on restart resumes from the last durable phase and never re-runs a non-idempotent phase; never retracts a drain-ack. TERMINAL-CLASS ATTESTATION: each terminal class writes exactly one typed attestation to compliance_audit under the (offboarding_id, component_id, attempt_id) idempotency key; canonical writer election by drain_state_log CAS shared with drain_coordinator. OPERATOR-OVERRIDE: operator-override admission (used during emergency rollover) requires M-of-N operator quorum signatures on the admit proposal — signing operators are recorded with the admit commit and visible in audit. ROSTER VERIFICATION: caches operator-credential roster locally with documented HLC-bounded freshness window; falls to deny-by-default for further override admissions when cached roster is older than the freshness window or no roster has ever been received; deny is sticky until a strictly-newer roster_version ack-readies. Override-commit path verifies the proposal against region_coordinator's currently-active roster_version (named-roster lookup, not local cache) at commit time, including evaluation of any retroactive-as-of-HLC compromise-revocation predating the proposal's submission HLC; commit fails closed if any signing credential is retroactively revoked; pre-commit roster_version is re-checked atomically with the pool_registry CAS commit so the activation race cannot slip between roster check and registry commit. Rejects proposals whose signing roster_version predates the currently-effective roster_version. Enforces a documented max-overrides-per-window rate limit on operator-override admissions that bypass safe-membership floor. Reads pool_registry through the per-(chain, fork_id) shard plus shard-level summaries for cross-shard consumers."
     },
     {
       "id": "drain_coordinator",
       "node_type": "Subservice",
-      "definition": "Choreographs pool drains: a drain proposal moves a replica into 'draining' state in pool_registry, refuses new requests routed to it, holds in-flight RPCs (or returns them with a retryable-on-other-replica hint), waits for gateway to re-bind dependent subscriptions via fanout, and only then commits the drain-completed transition. Owns drain_state_log entries: drain-requested, drain-in-progress, drain-completed, drain-aborted, force-completed (with operator attribution), drain-stuck (with rebind-ack-missed reason), drain-window-expired (typed terminal state distinct from drain-stuck and force-completed when the lifecycle_gate window's HLC TTL expired mid-drain), drain-stuck-after-crash (when a lease-holder crash without TERMINAL within the window leaves the replica observable to lifecycle_gate). LIFECYCLE-GATE-SCHEDULED: drain_coordinator subscribes to region_coordinator's lifecycle_gate schedule and admits replica-level drains only inside windows reserved by lifecycle_gate against the same target (chain pool, replica subset); never schedules an autonomous drain that overlaps a non-reserved window; refuses to start a drain whose lifecycle_gate window has expired. The per-(chain, fork_id, replica) drain mutex/lease is bounded by the lifecycle_gate window's HLC TTL: every drain start is stamped with the window_id and HLC TTL; if the TTL expires mid-drain, the drain transitions to drain-window-expired, refuses further per-replica work under the expired window, surfaces an alert with attribution to window_id, and the replica remains in 'draining' until a new lifecycle_gate-reserved continuation window admits a continuation drain (no autonomous force-complete under expired window); the prior lease is implicitly released at window expiry. Drain-completion is gated on a bounded wait: if gateway-rebind ack is not received within a documented window, drain_coordinator surfaces a drain-stuck alert and either retries the rebind request idempotently or proposes a force-complete transition that itself requires M-of-N-signed operator override under chain_router's currently-effective roster_version. Gateway-rebind acks carry an authenticated signature over the cert-bearing gateway-to-chain_router channel and a per-drain nonce so a replayed or forged ack cannot complete an active drain. PHASE-MARKERS: drain_coordinator persists durable per-(offboarding_id, component_id, drain_id) phase-markers in drain_state_log (RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL-ACK, TERMINAL-PRESERVATION-BLOCKED); on restart resumes from the latest durable phase, never re-runs flush if FLUSH-COMPLETE is durable, never retracts a drain-ack once emitted. DRAIN-FENCE BROADCAST CONSUMER: consumes lifecycle_gate-originated drain-fence broadcasts for tenant T as self-contained credential bundles (broadcasts name roster_version V_named); verifies the signature against V_named via on-demand named-roster fetch from region_coordinator over the cert-bearing inter-region surface when V_named is strictly newer than the local cache, bounded by a documented HLC budget tighter than the per-tenant ack window — on fetch failure within budget rejects the broadcast and emits a typed 'named-roster-unfetchable' attestation to compliance_audit; on bulk-offboarding waves coalesces named-roster fetches across the wave so N broadcasts trigger one fetch, on coalesced fetch failure rejecting the wave with a single typed 'named-roster-fetch-failed-bulk' attestation. On verified broadcast, drain_coordinator (with pool_membership_manager) flushes in-flight audit writes for tenant T to compliance_audit then acks drain to tenant_store within the HLC-bounded ack window. ROSTER FRESHNESS: caches the operator-credential roster locally with a documented HLC-bounded freshness window; falls to deny-by-default for further override admissions when the cached roster is older than the freshness window or no roster has ever been received; deny is sticky for that override path until a strictly-newer roster_version ack-readies. Rejects override proposals whose signing roster_version predates chain_router's currently-effective roster_version; refuses to commit overrides after a compromise-revocation invalidates any in-flight signature including retroactive-as-of-HLC compromise-revocations; cancel-and-rollback for in-flight proposals is performed atomically at activation. TERMINAL-CLASS ATTESTATION: TERMINAL-ACK and TERMINAL-PRESERVATION-BLOCKED each write exactly one typed attestation to compliance_audit with the (offboarding_id, component_id, attempt_id) idempotency key; canonical writer election by drain_state_log CAS so attestation is written exactly once. PRIORITY: drain-fence flush takes priority on the per-(chain, fork_id) pool_registry shard CAS line (drain-fence-priority tag pre-empts deferred-quarantine commits). DRAIN-FENCE VS FORK-TRANSITION FENCE: refuses to commit a drain-ack while a fork-transition handshake is mid-flight on any (chain, fork_id) shard whose audit writes for tenant T are in flight; ack-window HLC budget extends across handshake completion or the broadcast is rejected with a typed 'drain-fence-blocked-by-fork-transition' attestation; flush enumerates audit writes by tenant_id across both pre- and post-transition sub-pool views. TEARDOWN-OVERLAP HANDOFF: if the chain_router replica is itself in lifecycle teardown when a drain-fence arrives, drain_coordinator either completes flush-then-ack-then-teardown within the remaining teardown window, or writes a typed drain-ack-handoff record in drain_state_log naming a successor chain_router instance OR a persistent buffer (a tenant-T-flush-residual queue) that owns the residual flush; ack-by-handoff to tenant_store cites this record. drain_coordinator refuses teardown completion while any drain-fence on this instance is unacked AND no drain-ack-handoff is recorded; idempotent successor read of drain_state_log resumes the flush. On offboarding cancellation overlapping a preservation hold, the drain waits for the long-RPC to complete or to time out (capped by the bounded drain-completion wait), surfaces TERMINAL-PRESERVATION-BLOCKED state per the offboarding-attestation SLO, and dedupes inbound offboarding signals by (offboarding_id, component_id, attempt_id).",
-      "aspects": []
+      "definition": "Choreographs pool drains: a drain proposal moves a replica into 'draining' state in pool_registry, refuses new requests routed to it, holds in-flight RPCs (or returns them with a retryable-on-other-replica hint), waits for gateway to re-bind dependent subscriptions via fanout, and only then commits the drain-completed transition. Owns drain_state_log entries: drain-requested, drain-in-progress, drain-completed, drain-aborted, force-completed (with operator attribution), drain-stuck (with rebind-ack-missed reason), drain-window-expired (typed terminal state distinct from drain-stuck and force-completed when the lifecycle_gate window's HLC TTL expired mid-drain), drain-stuck-after-crash (when a lease-holder crash without TERMINAL within the window leaves the replica observable to lifecycle_gate). LIFECYCLE-GATE-SCHEDULED: drain_coordinator subscribes to region_coordinator's lifecycle_gate schedule and admits replica-level drains only inside windows reserved by lifecycle_gate against the same target (chain pool, replica subset); never schedules an autonomous drain that overlaps a non-reserved window; refuses to start a drain whose lifecycle_gate window has expired. The per-(chain, fork_id, replica) drain mutex/lease is bounded by the lifecycle_gate window's HLC TTL: every drain start is stamped with the window_id and HLC TTL; if the TTL expires mid-drain, the drain transitions to drain-window-expired, refuses further per-replica work under the expired window, surfaces an alert with attribution to window_id, and the replica remains in 'draining' until a new lifecycle_gate-reserved continuation window admits a continuation drain (no autonomous force-complete under expired window); the prior lease is implicitly released at window expiry. Drain-completion is gated on a bounded wait: if gateway-rebind ack is not received within a documented window, drain_coordinator surfaces a drain-stuck alert and either retries the rebind request idempotently or proposes a force-complete transition that itself requires M-of-N-signed operator override under chain_router's currently-effective roster_version. Gateway-rebind acks carry an authenticated signature over the cert-bearing gateway-to-chain_router channel and a per-drain nonce so a replayed or forged ack cannot complete an active drain. PHASE-MARKERS: drain_coordinator persists durable per-(offboarding_id, component_id, drain_id) phase-markers in drain_state_log (RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL-ACK, TERMINAL-PRESERVATION-BLOCKED); on restart resumes from the latest durable phase, never re-runs flush if FLUSH-COMPLETE is durable, never retracts a drain-ack once emitted. DRAIN-FENCE BROADCAST CONSUMER: consumes lifecycle_gate-originated drain-fence broadcasts for tenant T as self-contained credential bundles (broadcasts name roster_version V_named); verifies the signature against V_named via on-demand named-roster fetch from region_coordinator over the cert-bearing inter-region surface when V_named is strictly newer than the local cache, bounded by a documented HLC budget tighter than the per-tenant ack window — on fetch failure within budget rejects the broadcast and emits a typed 'named-roster-unfetchable' attestation to compliance_audit; on bulk-offboarding waves coalesces named-roster fetches across the wave so N broadcasts trigger one fetch, on coalesced fetch failure rejecting the wave with a single typed 'named-roster-fetch-failed-bulk' attestation. On verified broadcast, drain_coordinator (with pool_membership_manager) flushes in-flight audit writes for tenant T to compliance_audit then acks drain to tenant_store within the HLC-bounded ack window. ROSTER FRESHNESS: caches the operator-credential roster locally with a documented HLC-bounded freshness window; falls to deny-by-default for further override admissions when the cached roster is older than the freshness window or no roster has ever been received; deny is sticky for that override path until a strictly-newer roster_version ack-readies. Rejects override proposals whose signing roster_version predates chain_router's currently-effective roster_version; refuses to commit overrides after a compromise-revocation invalidates any in-flight signature including retroactive-as-of-HLC compromise-revocations; cancel-and-rollback for in-flight proposals is performed atomically at activation. TERMINAL-CLASS ATTESTATION: TERMINAL-ACK and TERMINAL-PRESERVATION-BLOCKED each write exactly one typed attestation to compliance_audit with the (offboarding_id, component_id, attempt_id) idempotency key; canonical writer election by drain_state_log CAS so attestation is written exactly once. PRIORITY: drain-fence flush takes priority on the per-(chain, fork_id) pool_registry shard CAS line (drain-fence-priority tag pre-empts deferred-quarantine commits). DRAIN-FENCE VS FORK-TRANSITION FENCE: refuses to commit a drain-ack while a fork-transition handshake is mid-flight on any (chain, fork_id) shard whose audit writes for tenant T are in flight; ack-window HLC budget extends across handshake completion or the broadcast is rejected with a typed 'drain-fence-blocked-by-fork-transition' attestation; flush enumerates audit writes by tenant_id across both pre- and post-transition sub-pool views. TEARDOWN-OVERLAP HANDOFF: if the chain_router replica is itself in lifecycle teardown when a drain-fence arrives, drain_coordinator either completes flush-then-ack-then-teardown within the remaining teardown window, or writes a typed drain-ack-handoff record in drain_state_log naming a successor chain_router instance OR a persistent buffer (a tenant-T-flush-residual queue) that owns the residual flush; ack-by-handoff to tenant_store cites this record. drain_coordinator refuses teardown completion while any drain-fence on this instance is unacked AND no drain-ack-handoff is recorded; idempotent successor read of drain_state_log resumes the flush. On offboarding cancellation overlapping a preservation hold, the drain waits for the long-RPC to complete or to time out (capped by the bounded drain-completion wait), surfaces TERMINAL-PRESERVATION-BLOCKED state per the offboarding-attestation SLO, and dedupes inbound offboarding signals by (offboarding_id, component_id, attempt_id)."
     },
     {
       "id": "response_canonicalizer",
       "node_type": "Subservice",
-      "definition": "Normalizes every JSON-RPC response leaving a chain pool replica into a canonical form keyed by (chain, method, schema_version): strips/sorts undocumented optional fields, coerces types, applies intra-response ordering. The canonicalizer's output is defined by an explicit canonical-bytes spec keyed by (chain, method, schema_version, canonical-bytes-version): canonical-bytes-version is distinct from schema_version and is bumped when byte-level field ordering, numeric type representation, or whitespace policy changes; the canonicalizer refuses to emit bytes for any (chain, method, schema_version) tuple lacking a registered canonical-bytes-version, and a previously-unseen field surface produces an explicit unknown-field signal rather than a silent canonicalization. Canonical-bytes output is validated against the canonical-bytes-version spec by an independent validator path that does not share code or in-process state with the transform path; the validator's verdict (canonical-affirmed vs canonicalizer-fault) is the input that schema_skew_quarantine consumes — a mis-transform produced by the transform path is detected by the validator and surfaced as a canonicalizer-fault alert distinct from a replica-skew alert. Reads from pool_registry are limited to the per-(chain, fork_id) shard summary needed to compute canonical-shape consensus.",
-      "aspects": []
+      "definition": "Normalizes every JSON-RPC response leaving a chain pool replica into a canonical form keyed by (chain, method, schema_version): strips/sorts undocumented optional fields, coerces types, applies intra-response ordering. The canonicalizer's output is defined by an explicit canonical-bytes spec keyed by (chain, method, schema_version, canonical-bytes-version): canonical-bytes-version is distinct from schema_version and is bumped when byte-level field ordering, numeric type representation, or whitespace policy changes; the canonicalizer refuses to emit bytes for any (chain, method, schema_version) tuple lacking a registered canonical-bytes-version, and a previously-unseen field surface produces an explicit unknown-field signal rather than a silent canonicalization. Canonical-bytes output is validated against the canonical-bytes-version spec by an independent validator path that does not share code or in-process state with the transform path; the validator's verdict (canonical-affirmed vs canonicalizer-fault) is the input that schema_skew_quarantine consumes — a mis-transform produced by the transform path is detected by the validator and surfaced as a canonicalizer-fault alert distinct from a replica-skew alert. Reads from pool_registry are limited to the per-(chain, fork_id) shard summary needed to compute canonical-shape consensus."
     },
     {
       "id": "schema_skew_quarantine",
       "node_type": "Subservice",
-      "definition": "Detects pool replicas whose canonicalized response shape diverges from the (chain, method, schema_version, canonical-bytes-version) cohort's pool consensus shape and proposes their transition to 'quarantined' in pool_registry. Divergence detection indexes consensus shape per cohort: a replica emitting under a new (schema_version, canonical-bytes-version) is compared against the new cohort, not the old; a new cohort is bootstrapped from the registered canonical-bytes-version spec rather than from existing pool members so detection works even when only one replica has rolled to the new version. Consumes the canonicalizer's independent validator verdicts; distinguishes a replica-skew verdict (canonicalized bytes diverge from validator-affirmed pool consensus) from a canonicalizer-fault verdict (validator rejects canonicalizer output as non-canonical). Refuses to commit replica quarantines when the prevailing fault is a canonicalizer-fault, surfacing canonicalizer-fault as its own alert. CANONICALIZER-FAULT NEVER ROTATION-SUPPRESSED: the canonicalizer-fault verdict is structurally orthogonal to rotation-tag suppression — rotation suppression applies ONLY to replica-skew verdicts. canonicalizer-fault is always recorded and surfaced, never suppressed during rotation-or-drain windows; the verdict is published to compliance_audit so post-mortem of any drained replica retains the evidence. ROTATION-TAG SUPPRESSION (replica-skew only): suppressed only when rotation-tag at observation time was active AND rotation event-type can legitimately change response shape (chain-pool blue/green or chain-client-version, not cert or origin-endpoint); rotation-tag's hlc_stamp is stamped on the proposal at observation, suppression decision tied to that stamp, and at commit time the stamped tag is re-checked against current region_coordinator state — a tag change that invalidates suppression triggers re-evaluation. A documented per-cohort suppression timeout caps how long a quarantine can be deferred. CAP: per-(chain, fork_id) max-concurrent-quarantine-commits cap within a documented window; commits beyond the cap are deferred and surfaced as alerts; the cap is at most a documented fraction of sub-pool membership. PRIORITY: deferred-quarantine commits wait when a drain-fence flush is mid-flight on the same (chain, fork_id) shard CAS line (drain-fence-priority pre-emption); pool_membership_manager surfaces an alert when quarantine deferral grows under drain-fence pressure. Maintains quarantine_set keyed by replica_id with the divergence evidence; reads pool_registry through the per-(chain, fork_id) shard.",
-      "aspects": []
+      "definition": "Detects pool replicas whose canonicalized response shape diverges from the (chain, method, schema_version, canonical-bytes-version) cohort's pool consensus shape and proposes their transition to 'quarantined' in pool_registry. Divergence detection indexes consensus shape per cohort: a replica emitting under a new (schema_version, canonical-bytes-version) is compared against the new cohort, not the old; a new cohort is bootstrapped from the registered canonical-bytes-version spec rather than from existing pool members so detection works even when only one replica has rolled to the new version. Consumes the canonicalizer's independent validator verdicts; distinguishes a replica-skew verdict (canonicalized bytes diverge from validator-affirmed pool consensus) from a canonicalizer-fault verdict (validator rejects canonicalizer output as non-canonical). Refuses to commit replica quarantines when the prevailing fault is a canonicalizer-fault, surfacing canonicalizer-fault as its own alert. CANONICALIZER-FAULT NEVER ROTATION-SUPPRESSED: the canonicalizer-fault verdict is structurally orthogonal to rotation-tag suppression — rotation suppression applies ONLY to replica-skew verdicts. canonicalizer-fault is always recorded and surfaced, never suppressed during rotation-or-drain windows; the verdict is published to compliance_audit so post-mortem of any drained replica retains the evidence. ROTATION-TAG SUPPRESSION (replica-skew only): suppressed only when rotation-tag at observation time was active AND rotation event-type can legitimately change response shape (chain-pool blue/green or chain-client-version, not cert or origin-endpoint); rotation-tag's hlc_stamp is stamped on the proposal at observation, suppression decision tied to that stamp, and at commit time the stamped tag is re-checked against current region_coordinator state — a tag change that invalidates suppression triggers re-evaluation. A documented per-cohort suppression timeout caps how long a quarantine can be deferred. CAP: per-(chain, fork_id) max-concurrent-quarantine-commits cap within a documented window; commits beyond the cap are deferred and surfaced as alerts; the cap is at most a documented fraction of sub-pool membership. PRIORITY: deferred-quarantine commits wait when a drain-fence flush is mid-flight on the same (chain, fork_id) shard CAS line (drain-fence-priority pre-emption); pool_membership_manager surfaces an alert when quarantine deferral grows under drain-fence pressure. Maintains quarantine_set keyed by replica_id with the divergence evidence; reads pool_registry through the per-(chain, fork_id) shard."
     },
     {
       "id": "tip_freshness_tracker",
       "node_type": "Subservice",
-      "definition": "Per-pool tip-freshness signal: measures each pool's tip lag against an out-of-band reference (peer-regional pools sourced via region_coordinator, chain peer count / expected slot advance for the chain) and marks a pool 'tip-stale' when its lag exceeds the per-chain freshness budget. Writes tip-stale state into pool_registry as a per-replica freshness flag (per-(chain, fork_id) shard) and surfaces the per-pool aggregate to fork_detection_alerter and to region_coordinator's tip_quorum. FRESHNESS AGGREGATE FILTER: the per-(chain, fork) freshness aggregate is computed only over replicas that would survive an immediate quarantine commit — replicas with deferred-quarantine flag (any reason) are excluded from the aggregate AND from the head-observation submission cohort, so a deferred-quarantine replica still serving observations cannot mask the surviving cohort's freshness. Uses region_coordinator's hybrid logical clock for freshness measurement; on the HLC-degraded marker the tracker freezes the tip-stale flag set in pool_registry — no transitions in or out of tip-stale commit while degraded; existing flags remain conservatively in place; refuses fallback to local wall-clock as the freshness reference. When HLC is degraded, may use chain-derived signals (chain peer count, expected slot advance, peer-regional pool's chain-coord head delta as relayed by region_coordinator on heal); flags derived from chain-only signals are tagged hlc-degraded so consumers apply them more conservatively. Tip-divergence quarantine proposals consult the rotation-tag with explicit event-type discrimination — suppressing only on chain-pool blue/green rotation events, not on cert/origin-endpoint or chain-client-version rotations alone — and stamp the rotation-tag's hlc_stamp on each proposal at observation; commit-time re-check forces re-evaluation if the tag's state has changed. FORK-TRANSITION-PENDING SUSPENSION: when sub_pool_fork_partitioner is in fork-transition-pending degraded mode for (chain, new_fork_id) (because fanout's handshake-ack is unavailable), tip_freshness_tracker treats the new sub-pool's tip-freshness as suspended (no fresh-vs-stale verdict committed) until the handshake completes.",
-      "aspects": []
+      "definition": "Per-pool tip-freshness signal: measures each pool's tip lag against an out-of-band reference (peer-regional pools sourced via region_coordinator, chain peer count / expected slot advance for the chain) and marks a pool 'tip-stale' when its lag exceeds the per-chain freshness budget. Writes tip-stale state into pool_registry as a per-replica freshness flag (per-(chain, fork_id) shard) and surfaces the per-pool aggregate to fork_detection_alerter and to region_coordinator's tip_quorum. FRESHNESS AGGREGATE FILTER: the per-(chain, fork) freshness aggregate is computed only over replicas that would survive an immediate quarantine commit — replicas with deferred-quarantine flag (any reason) are excluded from the aggregate AND from the head-observation submission cohort, so a deferred-quarantine replica still serving observations cannot mask the surviving cohort's freshness. Uses region_coordinator's hybrid logical clock for freshness measurement; on the HLC-degraded marker the tracker freezes the tip-stale flag set in pool_registry — no transitions in or out of tip-stale commit while degraded; existing flags remain conservatively in place; refuses fallback to local wall-clock as the freshness reference. When HLC is degraded, may use chain-derived signals (chain peer count, expected slot advance, peer-regional pool's chain-coord head delta as relayed by region_coordinator on heal); flags derived from chain-only signals are tagged hlc-degraded so consumers apply them more conservatively. Tip-divergence quarantine proposals consult the rotation-tag with explicit event-type discrimination — suppressing only on chain-pool blue/green rotation events, not on cert/origin-endpoint or chain-client-version rotations alone — and stamp the rotation-tag's hlc_stamp on each proposal at observation; commit-time re-check forces re-evaluation if the tag's state has changed. FORK-TRANSITION-PENDING SUSPENSION: when sub_pool_fork_partitioner is in fork-transition-pending degraded mode for (chain, new_fork_id) (because fanout's handshake-ack is unavailable), tip_freshness_tracker treats the new sub-pool's tip-freshness as suspended (no fresh-vs-stale verdict committed) until the handshake completes."
     },
     {
       "id": "fork_detection_alerter",
       "node_type": "Subservice",
-      "definition": "Identifies (chain, fork_id) candidates from pool replicas' chain-head observations: when replicas in a sub-pool diverge into two stable subgroups (neither a transient reorg), emits a fork-detected alert with a documented operator-decision SLA. Submission to region_coordinator's tip_quorum is gated on a local stability threshold: a (chain, fork_id) candidate is submitted only after at least K independent local replicas have confirmed it within a documented stability window, and only one canonical local-stability submission is sent per (chain, fork_id) per submission window — subsequent observations within the window update the local view but do not generate fresh submissions. Enforces an internal max-submissions-per-window rate limit documented to fit within tip_quorum's per-source rate budget with headroom; approaching the limit surfaces an alert; exceeding it suppresses further submissions in the window with a documented suppression count for operator audit. Each head observation submitted to tip_quorum is tagged with the authenticated source replica identity of the submitting chain_router replica and signed over the cert-bearing inter-region surface (mTLS to region_coordinator), so per-source rate limit and adversarial-source quarantine apply at tip_quorum. SUBMISSION COHORT FILTER: filters its set of contributing replicas by pool_registry's deferred-quarantine flag (in addition to admitted/non-draining/non-tip-stale): a replica with deferred-quarantine for any reason is excluded from the head-observation submission cohort so a replica still serving observations under a deferred quarantine cannot inject signals into tip_quorum before its quarantine commits. Each candidate carries the tip-freshness flag (read from pool_registry) and the freshness-derivation tag (hlc-affirmed or hlc-degraded) so tip_quorum's quorum can apply IR-stale-pool-quorum-exclusion and degradation-aware weighting at submission time. FORK-TRANSITION HANDSHAKE: drives the cross-component fork-transition handshake — when local stability is reached and tip_quorum confirms (or operator override admits) the new (chain, fork_id), fork_detection_alerter signals pool_membership_manager to commit the new sub-pool's membership in pool_registry, then signals sub_pool_fork_partitioner to emit the fork-transition handshake to fanout (carrying chain_id, prior fork_id, new fork_id, divergence HLC, prior fork terminal HLC). On fanout-suspended in this region (per gateway_health_surface) signals sub_pool_fork_partitioner to enter fork-transition-pending degraded mode rather than unilaterally unblocking dispatch. NAMED-ROSTER VERIFICATION: signed broadcasts consumed by the alerter (operator overrides on fork-detection decisions, retroactive-revocations of operator credentials affecting prior fork-detection submissions) are verified against the broadcast's NAMED roster_version via on-demand named-roster fetch from region_coordinator when V_named is strictly newer than the local cache; on fetch failure within budget rejects the broadcast and emits a typed 'named-roster-unfetchable' attestation to compliance_audit. Local roster cache acts only as the freshness witness, not as the authority.",
-      "aspects": []
+      "definition": "Identifies (chain, fork_id) candidates from pool replicas' chain-head observations: when replicas in a sub-pool diverge into two stable subgroups (neither a transient reorg), emits a fork-detected alert with a documented operator-decision SLA. Submission to region_coordinator's tip_quorum is gated on a local stability threshold: a (chain, fork_id) candidate is submitted only after at least K independent local replicas have confirmed it within a documented stability window, and only one canonical local-stability submission is sent per (chain, fork_id) per submission window — subsequent observations within the window update the local view but do not generate fresh submissions. Enforces an internal max-submissions-per-window rate limit documented to fit within tip_quorum's per-source rate budget with headroom; approaching the limit surfaces an alert; exceeding it suppresses further submissions in the window with a documented suppression count for operator audit. Each head observation submitted to tip_quorum is tagged with the authenticated source replica identity of the submitting chain_router replica and signed over the cert-bearing inter-region surface (mTLS to region_coordinator), so per-source rate limit and adversarial-source quarantine apply at tip_quorum. SUBMISSION COHORT FILTER: filters its set of contributing replicas by pool_registry's deferred-quarantine flag (in addition to admitted/non-draining/non-tip-stale): a replica with deferred-quarantine for any reason is excluded from the head-observation submission cohort so a replica still serving observations under a deferred quarantine cannot inject signals into tip_quorum before its quarantine commits. Each candidate carries the tip-freshness flag (read from pool_registry) and the freshness-derivation tag (hlc-affirmed or hlc-degraded) so tip_quorum's quorum can apply IR-stale-pool-quorum-exclusion and degradation-aware weighting at submission time. FORK-TRANSITION HANDSHAKE: drives the cross-component fork-transition handshake — when local stability is reached and tip_quorum confirms (or operator override admits) the new (chain, fork_id), fork_detection_alerter signals pool_membership_manager to commit the new sub-pool's membership in pool_registry, then signals sub_pool_fork_partitioner to emit the fork-transition handshake to fanout (carrying chain_id, prior fork_id, new fork_id, divergence HLC, prior fork terminal HLC). On fanout-suspended in this region (per gateway_health_surface) signals sub_pool_fork_partitioner to enter fork-transition-pending degraded mode rather than unilaterally unblocking dispatch. NAMED-ROSTER VERIFICATION: signed broadcasts consumed by the alerter (operator overrides on fork-detection decisions, retroactive-revocations of operator credentials affecting prior fork-detection submissions) are verified against the broadcast's NAMED roster_version via on-demand named-roster fetch from region_coordinator when V_named is strictly newer than the local cache; on fetch failure within budget rejects the broadcast and emits a typed 'named-roster-unfetchable' attestation to compliance_audit. Local roster cache acts only as the freshness witness, not as the authority."
     },
     {
       "id": "pool_registry",
       "node_type": "StateSet",
-      "definition": "Local in-process registry of every chain pool replica, sharded by (chain, fork_id): each sub-pool's lifecycle entries live in their own shard with independent CAS lines so high-rate transitions on one sub-pool do not contend with reads or writes on others. Each entry is keyed by (chain, fork_id, replica_id) and carries the replica's lifecycle state (admitted / draining / evicted / quarantined / deferred-quarantine), tip-freshness flag (with hlc-affirmed vs hlc-degraded derivation tag), current schema_version and canonical-bytes-version, replica-class (tip-serving / historical-archive / both), and the hlc_stamp of the last state transition. Sub-pool transitions carry a fork-transition hlc_stamp consumed by sub_pool_fork_partitioner's routing-table fence. FORK-TRANSITION HANDSHAKE STATE: per-(chain, fork_id) shard records fanout-handshake-ack state — pending (handshake emitted, ack not received), acked (with divergence-point HLC), suspended (fanout-suspended in region, no ack expected); sub_pool_fork_partitioner consults this state before admitting forward-progress dispatch on the new fork_id. PRIORITY LANE: per-shard CAS line tags drain-fence transitions as drain-fence-priority so they pre-empt deferred-quarantine commits on the same shard. Cross-shard reads (e.g. effective-capacity denominator, target-capacity audit) consume per-shard summaries rather than scanning the global registry. Lifecycle transitions are gated by drain_state_log per the membership manager's CAS rules; quarantine transitions respect the safe-membership floor.",
-      "aspects": []
+      "definition": "Local in-process registry of every chain pool replica, sharded by (chain, fork_id): each sub-pool's lifecycle entries live in their own shard with independent CAS lines so high-rate transitions on one sub-pool do not contend with reads or writes on others. Each entry is keyed by (chain, fork_id, replica_id) and carries the replica's lifecycle state (admitted / draining / evicted / quarantined / deferred-quarantine), tip-freshness flag (with hlc-affirmed vs hlc-degraded derivation tag), current schema_version and canonical-bytes-version, replica-class (tip-serving / historical-archive / both), and the hlc_stamp of the last state transition. Sub-pool transitions carry a fork-transition hlc_stamp consumed by sub_pool_fork_partitioner's routing-table fence. FORK-TRANSITION HANDSHAKE STATE: per-(chain, fork_id) shard records fanout-handshake-ack state — pending (handshake emitted, ack not received), acked (with divergence-point HLC), suspended (fanout-suspended in region, no ack expected); sub_pool_fork_partitioner consults this state before admitting forward-progress dispatch on the new fork_id. PRIORITY LANE: per-shard CAS line tags drain-fence transitions as drain-fence-priority so they pre-empt deferred-quarantine commits on the same shard. Cross-shard reads (e.g. effective-capacity denominator, target-capacity audit) consume per-shard summaries rather than scanning the global registry. Lifecycle transitions are gated by drain_state_log per the membership manager's CAS rules; quarantine transitions respect the safe-membership floor."
     },
     {
       "id": "quarantine_set",
       "node_type": "StateSet",
-      "definition": "Per-replica quarantine evidence keyed by replica_id with the divergence reason (replica-skew / canonicalizer-fault / tip-divergence / fork-suspect), the observation evidence (canonical shape vs observed, canonical-bytes-version), the cohort the divergence was scored against (chain, method, schema_version, canonical-bytes-version), the rotation-in-progress tag's event-type and hlc_stamp at observation time, the suppression deadline, and the deferred-quarantine commit cap window state. Read by pool_membership_manager and operator surfaces; written only by schema_skew_quarantine and tip_freshness_tracker.",
-      "aspects": []
+      "definition": "Per-replica quarantine evidence keyed by replica_id with the divergence reason (replica-skew / canonicalizer-fault / tip-divergence / fork-suspect), the observation evidence (canonical shape vs observed, canonical-bytes-version), the cohort the divergence was scored against (chain, method, schema_version, canonical-bytes-version), the rotation-in-progress tag's event-type and hlc_stamp at observation time, the suppression deadline, and the deferred-quarantine commit cap window state. Read by pool_membership_manager and operator surfaces; written only by schema_skew_quarantine and tip_freshness_tracker."
     },
     {
       "id": "drain_state_log",
       "node_type": "StateSet",
-      "definition": "Append-only log of drain transitions per replica keyed by drain_id and (chain, fork_id, replica_id): drain-requested, drain-in-progress, drain-completed, drain-aborted, force-completed (with M-of-N operator attribution), drain-stuck (with rebind-ack-missed reason), drain-window-expired (with lifecycle_gate window_id and HLC TTL evidence), drain-stuck-after-crash (lease-holder crash without TERMINAL within window). PHASE-MARKERS: each drain entry carries durable per-(offboarding_id, component_id, drain_id) phase-markers (RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL-ACK, TERMINAL-PRESERVATION-BLOCKED) so on restart the next instance resumes from the latest durable phase. Each entry carries the gateway-rebind acknowledgement timestamp (when received), the authenticated signature and per-drain nonce of the ack, the lifecycle_gate window_id and HLC TTL bounding the lease, and the bounded-wait deadline. DRAIN-ACK-HANDOFF RECORD: a typed drain-ack-handoff entry names a successor chain_router instance or a persistent buffer (a tenant-T-flush-residual queue) that owns the residual flush; ack-by-handoff to tenant_store cites this record. Read by drain_coordinator and pool_membership_manager (whose lifecycle CAS rules consult the latest drain_state_log entry); written only by drain_coordinator.",
-      "aspects": []
+      "definition": "Append-only log of drain transitions per replica keyed by drain_id and (chain, fork_id, replica_id): drain-requested, drain-in-progress, drain-completed, drain-aborted, force-completed (with M-of-N operator attribution), drain-stuck (with rebind-ack-missed reason), drain-window-expired (with lifecycle_gate window_id and HLC TTL evidence), drain-stuck-after-crash (lease-holder crash without TERMINAL within window). PHASE-MARKERS: each drain entry carries durable per-(offboarding_id, component_id, drain_id) phase-markers (RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL-ACK, TERMINAL-PRESERVATION-BLOCKED) so on restart the next instance resumes from the latest durable phase. Each entry carries the gateway-rebind acknowledgement timestamp (when received), the authenticated signature and per-drain nonce of the ack, the lifecycle_gate window_id and HLC TTL bounding the lease, and the bounded-wait deadline. DRAIN-ACK-HANDOFF RECORD: a typed drain-ack-handoff entry names a successor chain_router instance or a persistent buffer (a tenant-T-flush-residual queue) that owns the residual flush; ack-by-handoff to tenant_store cites this record. Read by drain_coordinator and pool_membership_manager (whose lifecycle CAS rules consult the latest drain_state_log entry); written only by drain_coordinator."
     }
   ],
   "edges": [
@@ -259,7 +247,8 @@
       "description": "Each chain pool is partitioned by (chain_id, fork_id) so per-fork sub-pools serve fork-specific traffic; routing of an incoming RPC tagged with (chain, fork) goes only to the matching sub-pool, and replicas across forks are sub-pool members rather than divergent peers.",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IR-pool-drain-protocol",
@@ -277,7 +266,8 @@
       "description": "A replica entering 'draining' state stops receiving new requests, finishes in-flight RPCs (or returns them with a retryable-on-other-replica hint), and only after gateway has re-bound dependent subscriptions does the replica unsubscribe from fanout's head streams; eviction commits only after gateway-rebind acknowledgement.",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IR-response-canonicalization",
@@ -289,7 +279,8 @@
       "description": "Every JSON-RPC response forwarded from a chain pool replica is canonicalized against a per-(chain, method, schema_version) schema before reaching gateway: undocumented optional fields stripped or sorted, types coerced, intra-response ordering rules applied so response shape is independent of which client implementation answered.",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IR-schema-skew-quarantine",
@@ -307,7 +298,8 @@
       "description": "When a replica's canonicalized response shape diverges from the (chain, method, schema_version) pool consensus shape, the replica is quarantined from the active sub-pool and the divergence evidence is surfaced to operators.",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IR-rotation-aware-skew",
@@ -322,7 +314,8 @@
       "description": "Schema-skew and tip-divergence quarantines consult region_coordinator's rotation-in-progress tag and suppress quarantines triggered solely by the documented rotation window so rotation noise does not look like a misbehaving replica.",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IR-tip-freshness-budget",
@@ -337,7 +330,8 @@
       "description": "Each chain has a per-chain tip-freshness budget; chain_router measures pool tip lag against an out-of-band reference (peer-regional pools via region_coordinator, chain peer count, expected slot advance) and marks pools tip-stale when they exceed the budget.",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "IR-fork-detection-alert",
@@ -349,7 +343,8 @@
       "description": "Detection of an unannounced consensus split (replicas in a sub-pool diverging into two stable subgroups, neither a transient reorg) surfaces a 'fork-detected' alert with a documented operator-decision SLA before the split is exposed to tenants as a separate fork sub-pool.",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IR-head-observation-authenticated",
@@ -361,7 +356,8 @@
       "description": "Every head observation submitted to region_coordinator's tip_quorum is tagged with the authenticated source replica identity of the submitting chain_router replica and signed over the cert-bearing inter-region surface (mTLS to region_coordinator) so per-source rate limit and adversarial-source quarantine can be applied at tip_quorum.",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IR-offboarding-idempotency",
@@ -376,7 +372,8 @@
       "description": "Cancellation of in-flight long-RPCs for offboarded tenants dedupes inbound offboarding signals from region_coordinator by idempotency key (offboarding_id, component_id, attempt_id), meets a documented attestation SLO, and surfaces preservation-blocked terminal states (e.g. when an in-flight long-RPC overlaps a preservation hold) so region_coordinator can record best-effort attestations rather than waiting indefinitely.",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-canonical-bytes-spec",
@@ -390,7 +387,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s1-canonicalizer-silent-drift"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-replica-fork-revalidate",
@@ -407,7 +405,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s2-fork-transition-misroute"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-fork-transition-routing-fence",
@@ -424,7 +423,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s2-fork-transition-misroute"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-drain-state-cas-gate",
@@ -447,7 +447,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s3-drain-readd-race"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "SR-drain-abort-explicit",
@@ -467,7 +468,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s3-drain-readd-race"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-quarantine-schema-version-aware",
@@ -484,7 +486,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s4-quarantine-cascade-rollout"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-quarantine-mass-evict-cap",
@@ -504,7 +507,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s4-quarantine-cascade-rollout"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "SR-quarantine-floor-gate",
@@ -521,7 +525,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s4-quarantine-cascade-rollout"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "SR-tip-freshness-hlc-degraded-freeze",
@@ -538,7 +543,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s5-tip-freshness-clock-fallback"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-tip-freshness-chain-derived-fallback",
@@ -555,7 +561,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s5-tip-freshness-clock-fallback"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-fork-alerter-local-stability-gate",
@@ -569,7 +576,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s6-fork-alerter-flood"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-fork-alerter-self-rate-limit",
@@ -583,7 +591,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s6-fork-alerter-flood"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "SR-sub-pool-capacity-rebalance",
@@ -600,7 +609,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s7-sub-pool-capacity-starvation"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-effective-capacity-denominator",
@@ -620,7 +630,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s8-partial-quarantine-latency-amp"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "SR-canonicalizer-quarantine-independent-validators",
@@ -637,7 +648,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s9-canonicalizer-quarantine-coupling"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "SR-quarantine-canonicalizer-fault-distinct",
@@ -654,7 +666,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s9-canonicalizer-quarantine-coupling"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-pool-admit-override-mofn",
@@ -671,7 +684,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s10-pool-admit-operator-override-credential"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-pool-admit-override-rate-limit",
@@ -685,7 +699,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s10-pool-admit-operator-override-credential"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "SR-rotation-tag-hlc-stamped",
@@ -702,7 +717,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s11-rotation-tag-stale-read"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-drain-rebind-ack-bounded",
@@ -719,7 +735,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s12-drain-rebind-ack-forgery-or-stall"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "SR-drain-rebind-ack-authenticated",
@@ -736,7 +753,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s12-drain-rebind-ack-forgery-or-stall"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-pool-registry-shard-by-fork",
@@ -756,7 +774,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s13-pool-registry-hot-shard"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "SR-replica-class-tip-vs-archive",
@@ -776,7 +795,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s14-historical-vs-tip-isolation"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR-rotation-tag-typed",
@@ -793,7 +813,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "s15-rotation-tag-orthogonal-events"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IIR-drain-fence-broadcast-consume",
@@ -808,7 +829,8 @@
       "description": "chain_router consumes the lifecycle_gate-originated drain-fence broadcast for tenant T: drain_coordinator and pool_membership_manager flush in-flight audit writes for T to compliance_audit and ack drain to tenant_store within the HLC-bounded ack window; the drain-fence broadcast is verified as a self-contained credential bundle (broadcast names roster_version; verification is against the named roster_version, not the local cache).",
       "origin": {
         "type": "Freestanding"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IIR-lifecycle-gate-scheduled-drain",
@@ -823,7 +845,8 @@
       "description": "drain_coordinator's replica-level pool drain is admitted only inside windows reserved by lifecycle_gate against the same target (chain pool, replica subset). drain_coordinator subscribes to lifecycle_gate's schedule, never schedules an autonomous drain that overlaps a non-reserved window, and refuses to start a drain whose lifecycle_gate window has expired. The mutex/lease is per-(chain, fork_id, replica) and bounded by the lifecycle_gate window's HLC TTL; lease-holder crash mid-drain leaves drain_state_log in drain-stuck and surfaces an alert.",
       "origin": {
         "type": "Freestanding"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IIR-broadcast-named-roster-verify",
@@ -841,7 +864,8 @@
       "description": "Every signed broadcast consumed by chain_router subsystems (offboarding signal, drain-fence broadcast, lifecycle-gate-scheduled drain window, roster updates) is treated as a self-contained credential bundle: chain_router verifies the signature against the broadcast's NAMED roster_version, not the locally cached roster_version, and rejects broadcasts whose named roster_version is unknown or has been retroactively revoked. Local roster cache acts only as the freshness witness, not as the authority.",
       "origin": {
         "type": "Freestanding"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IIR-roster-freshness-window",
@@ -856,7 +880,8 @@
       "description": "chain_router caches the operator-credential roster locally with a documented HLC-bounded freshness window; pool_membership_manager and drain_coordinator fall to deny-by-default for further override admissions when the cached roster is older than the freshness window or when no roster has ever been received; deny is sticky for that override path until a strictly-newer roster_version ack-readies.",
       "origin": {
         "type": "Freestanding"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "IIR-roster-version-rejection",
@@ -871,7 +896,8 @@
       "description": "pool_membership_manager and drain_coordinator reject any operator-override proposal whose signing roster_version predates chain_router's currently-effective roster_version, and refuse to commit overrides after a compromise-revocation invalidates any in-flight signature (including retroactive compromise-revocations whose retroactive-as-of-HLC predates the proposal's submission); cancel-and-rollback for in-flight proposals is performed atomically at activation by roster_version.",
       "origin": {
         "type": "Freestanding"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IIR-fork-transition-handshake-fanout",
@@ -889,7 +915,8 @@
       "description": "When fork_detection_alerter produces a sub-pool repartition for (chain, fork_id), chain_router emits a structured fork-transition handshake to fanout that names the divergence point (chain_id, prior fork_id, new fork_id, divergence height/HLC). The handshake protocol is initiated by sub_pool_fork_partitioner only after pool_membership_manager has committed the new sub-pool's membership in pool_registry and the routing-table fence has admitted the new fork; chain_router does not begin dispatching forward-progress requests on the new fork to fanout until fanout has acked the handshake.",
       "origin": {
         "type": "Freestanding"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IIR-offboarding-phase-markers",
@@ -907,7 +934,8 @@
       "description": "pool_membership_manager and drain_coordinator maintain a durable per-(offboarding_id, component_id) apply-state record with typed phase-markers (RECEIVED, FLUSH-IN-PROGRESS, FLUSH-COMPLETE, ACK-EMITTED, ATTESTATION-WRITTEN, TERMINAL); on restart resumes from the last durable phase and never re-runs a non-idempotent phase; never retracts a drain-ack once emitted; flush-in-progress includes flushing in-flight audit writes for the tenant to compliance_audit before ack-emit.",
       "origin": {
         "type": "Freestanding"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "IIR-teardown-overlap-handoff",
@@ -922,7 +950,8 @@
       "description": "If a chain_router replica is itself in lifecycle teardown when a drain-fence broadcast arrives for tenant T, drain_coordinator either completes flush-then-ack-then-teardown within the remaining teardown window, or writes a durable drain-ack-handoff record (in drain_state_log) naming a successor chain_router instance or persistent buffer that owns the residual flush; ack-by-handoff to tenant_store is permitted only via that durable record.",
       "origin": {
         "type": "Freestanding"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-drain-window-expiry-terminal",
@@ -939,7 +968,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-drain-window-expiry-mid-drain"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-drain-fence-priority-lane",
@@ -959,7 +989,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-drain-fence-during-quarantine-cascade"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "SR2-named-roster-on-demand-fetch",
@@ -979,7 +1010,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-named-roster-unknown-locally"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-fork-transition-fanout-ack-fence",
@@ -999,7 +1031,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-fork-transition-handshake-vs-fanout-monotonicity"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-phase-markers-durable",
@@ -1016,7 +1049,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-mutex-lease-holder-crash"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-drain-lease-window-bounded",
@@ -1033,7 +1067,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-mutex-lease-holder-crash"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "SR2-canonicalizer-fault-no-rotation-suppress",
@@ -1050,7 +1085,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-schema-skew-during-rotation-and-drain"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-tip-quorum-deferred-quarantine-exclude",
@@ -1070,7 +1106,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-tip-freshness-during-quarantine-of-tip-replica"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-terminal-class-attestation-distinct",
@@ -1090,7 +1127,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-long-rpc-cancel-vs-preservation-blocked"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-cost-class-hint-retry-preserve",
@@ -1107,7 +1145,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-cost-class-hint-missing-on-rerouted-retry"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-override-commit-named-roster",
@@ -1124,7 +1163,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-pool-admit-override-during-compromise-revocation"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-drain-fence-vs-fork-transition-fence",
@@ -1144,7 +1184,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-drain-fence-broadcast-during-fork-transition"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-drain-ack-handoff-record",
@@ -1161,7 +1202,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-replica-teardown-during-drain-fence"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-bulk-roster-fetch-coalesce",
@@ -1178,7 +1220,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-stale-roster-cache-during-bulk-offboarding"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "SR2-fork-transition-pending-degraded-mode",
@@ -1198,7 +1241,8 @@
         "type": "Stressor",
         "session": 2,
         "stressor": "s2-fork-transition-handshake-fanout-unreachable"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "bubble-pool_membership_manager-1",
@@ -1210,7 +1254,8 @@
       "description": "pool_membership_manager's override_admission_engine maintains separate counters for operator-emergency overrides vs lifecycle_gate-driven bulk_admit overrides; the bulk_admit budget contract (size, per-wave headroom, refresh cadence) is parent-scope because lifecycle_gate (parent's parent through region_coordinator) drives bulk-wave admit traffic and must publish a wave_id and bulk_admit budget on each wave so chain_router can size the bulk_admit counter without consuming the emergency override counter. Without this contract, bulk-wave admits could exhaust the operator-emergency override headroom and starve genuine emergencies. Per s5-bulk-wave-evict-vs-budget-coupled-admit.",
       "origin": {
         "type": "Freestanding"
-      }
+      },
+      "kind": "functional"
     }
   ],
   "satisfactions": [
@@ -1438,5 +1483,9 @@
       "requirement_id": "SR2-fork-transition-pending-degraded-mode",
       "explanation": "sub_pool_fork_partitioner redefinition: 'when fanout's handshake-ack is unavailable (fanout-suspended in region per gateway_health_surface), sub_pool_fork_partitioner enters a documented fork-transition-pending degraded mode for the affected (chain, fork_id) — refuses dispatch tagged with the new fork_id with a typed fork-transition-pending error... chain_router NEVER dispatches forward-progress on the new fork without a fanout ack'. tip_freshness_tracker redefinition: 'tip_freshness_tracker treats the new sub-pool's tip-freshness as suspended... until the handshake completes'. pool_registry tracks suspended state on the per-(chain, fork_id) shard."
     }
-  ]
+  ],
+  "decisions": [],
+  "decision_id_allocator": {
+    "next_serial": 0
+  }
 }

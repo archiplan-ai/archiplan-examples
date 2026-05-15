@@ -3,26 +3,22 @@
     {
       "name": "Subrole",
       "definition": "An internal worker process within gateway that handles a specific class of incoming client interaction (RPC requests, websocket subscriptions, or metrics queries). Stateless beyond per-request locals; collaborates with sidecars and external services",
-      "layer": "epistatic",
-      "aspects": []
+      "layer": "epistatic"
     },
     {
       "name": "Listener",
       "definition": "The outer connection acceptor: terminates HTTP and websocket framing for traffic forwarded by edge, parses the minimal envelope (route, protocol version, API key header), and dispatches each connection or request to the appropriate Subrole. Holds no per-tenant state",
-      "layer": "epistatic",
-      "aspects": []
+      "layer": "epistatic"
     },
     {
       "name": "Sidecar",
       "definition": "An in-process cross-cutting helper used by every Subrole on the request hot path (e.g. auth/throttle gate). Exists once per gateway process and is invoked synchronously by the Subroles",
-      "layer": "epistatic",
-      "aspects": []
+      "layer": "epistatic"
     },
     {
       "name": "External",
       "definition": "A collaborator that lives outside the gateway scope (in the parent architecture) but is referenced here so its coupling to gateway internals is visible. The boundary node is a stand-in for the parent component, not a re-implementation",
-      "layer": "epistatic",
-      "aspects": []
+      "layer": "epistatic"
     }
   ],
   "edge_types": [
@@ -121,80 +117,67 @@
     {
       "id": "listener",
       "node_type": "Listener",
-      "definition": "Outer HTTP/WS connection acceptor and in-process control plane: terminates HTTP and websocket framing for traffic forwarded by edge, parses minimal envelope (route, protocol/schema version handshake, API key header, chain_router-supplied per-method cost class for RPCs), and dispatches each connection or request to the appropriate Subrole. Owns the in-process hybrid logical clock — refreshes from region_coordinator on a documented cadence and on skew-threshold transitions, and exposes a single HLC snapshot to every Subrole and Sidecar via a process-local accessor (Subroles never call region_coordinator for HLC directly). Persists last-known protocol-version, residency hints, and HLC seed to a local read cache; on startup serves traffic from last-known-good values when region_coordinator is unreachable and surfaces the degraded state in metrics. Applies a region-wide concurrent-handshake admission budget and emits jittered-backoff hints to clients past the threshold. Aggregates per-Subrole liveness (in particular fanout-suspended from subscription_path) into a region-level health surface that edge_filter consumes for residency-aware traffic shifting. Holds no per-tenant state",
-      "aspects": []
+      "definition": "Outer HTTP/WS connection acceptor and in-process control plane: terminates HTTP and websocket framing for traffic forwarded by edge, parses minimal envelope (route, protocol/schema version handshake, API key header, chain_router-supplied per-method cost class for RPCs), and dispatches each connection or request to the appropriate Subrole. Owns the in-process hybrid logical clock — refreshes from region_coordinator on a documented cadence and on skew-threshold transitions, and exposes a single HLC snapshot to every Subrole and Sidecar via a process-local accessor (Subroles never call region_coordinator for HLC directly). Persists last-known protocol-version, residency hints, and HLC seed to a local read cache; on startup serves traffic from last-known-good values when region_coordinator is unreachable and surfaces the degraded state in metrics. Applies a region-wide concurrent-handshake admission budget and emits jittered-backoff hints to clients past the threshold. Aggregates per-Subrole liveness (in particular fanout-suspended from subscription_path) into a region-level health surface that edge_filter consumes for residency-aware traffic shifting. Holds no per-tenant state"
     },
     {
       "id": "request_path",
       "node_type": "Subrole",
-      "definition": "Handles JSON-RPC request handling: receives a dispatched RPC envelope (with chain_router-supplied per-method cost class hint from the listener), runs auth_check, and forwards the chain-native RPC payload verbatim to chain_router (passthrough — no schema rewrite). Maintains a partitioned in-flight slot pool keyed by cost class (short-RPC and long-RPC pools) so long-tail historical queries cannot starve short ones; over-budget long-tail traffic surfaces a 'try chunking' error rather than blocking. For streaming or chunked RPC responses, re-evaluates the tenant's throttle-flag version (from auth_cache via the auth_check re-check path) before yielding further chunks; stops yielding when the flag becomes set. Attaches finality metadata returned by chain_router to the response payload. Emits per-request and per-chunk usage signals to usage_meter. Reads HLC bucket from the listener's process-local accessor (not region_coordinator). Stateless beyond the in-flight slot bookkeeping",
-      "aspects": []
+      "definition": "Handles JSON-RPC request handling: receives a dispatched RPC envelope (with chain_router-supplied per-method cost class hint from the listener), runs auth_check, and forwards the chain-native RPC payload verbatim to chain_router (passthrough — no schema rewrite). Maintains a partitioned in-flight slot pool keyed by cost class (short-RPC and long-RPC pools) so long-tail historical queries cannot starve short ones; over-budget long-tail traffic surfaces a 'try chunking' error rather than blocking. For streaming or chunked RPC responses, re-evaluates the tenant's throttle-flag version (from auth_cache via the auth_check re-check path) before yielding further chunks; stops yielding when the flag becomes set. Attaches finality metadata returned by chain_router to the response payload. Emits per-request and per-chunk usage signals to usage_meter. Reads HLC bucket from the listener's process-local accessor (not region_coordinator). Stateless beyond the in-flight slot bookkeeping"
     },
     {
       "id": "subscription_path",
       "node_type": "Subrole",
-      "definition": "Handles WebSocket subscription lifecycle: receives a dispatched WS upgrade with subscription parameters (chain, kind, address filters, confirmation threshold, optional resume cursor), runs auth_check, and registers the subscription with fanout — coalescing concurrent subscribes into per-chain batches under reconnect-storm load to bound fanout's subscribe-RPC fan-out. Forwards every event fanout returns to the client connection; forwards rollback notifications, finality tags, and pending-tx state-machine transitions verbatim. Enforces a bounded per-subscription egress queue with a documented overflow policy: on overflow, emits a 'slow-consumer' control event to the client and reports the consumer rate back to fanout so its ring-buffer cursor stays bounded; persistent overflow may force-unsubscribe the slow client with a documented reason. Operates a fanout-liveness watchdog: on extended fanout unreachability or sustained subscribe failure, emits a 'stream-suspended' control event carrying the last-known cursor and reconnect guidance, and surfaces the suspended state to the listener health surface. Re-evaluates the tenant's throttle-flag version on a documented interval; tears down the subscription with an explicit control event when the flag becomes set. Reads HLC bucket from the listener's process-local accessor. No per-subscription registry state lives here — fanout owns the registry, ring buffer, cursor positions, and address index",
-      "aspects": []
+      "definition": "Handles WebSocket subscription lifecycle: receives a dispatched WS upgrade with subscription parameters (chain, kind, address filters, confirmation threshold, optional resume cursor), runs auth_check, and registers the subscription with fanout — coalescing concurrent subscribes into per-chain batches under reconnect-storm load to bound fanout's subscribe-RPC fan-out. Forwards every event fanout returns to the client connection; forwards rollback notifications, finality tags, and pending-tx state-machine transitions verbatim. Enforces a bounded per-subscription egress queue with a documented overflow policy: on overflow, emits a 'slow-consumer' control event to the client and reports the consumer rate back to fanout so its ring-buffer cursor stays bounded; persistent overflow may force-unsubscribe the slow client with a documented reason. Operates a fanout-liveness watchdog: on extended fanout unreachability or sustained subscribe failure, emits a 'stream-suspended' control event carrying the last-known cursor and reconnect guidance, and surfaces the suspended state to the listener health surface. Re-evaluates the tenant's throttle-flag version on a documented interval; tears down the subscription with an explicit control event when the flag becomes set. Reads HLC bucket from the listener's process-local accessor. No per-subscription registry state lives here — fanout owns the registry, ring buffer, cursor positions, and address index"
     },
     {
       "id": "metrics_api",
       "node_type": "Subrole",
-      "definition": "Handles tenant metrics read API: receives a dispatched HTTP request for tenant usage/error/latency/rate-limit-headroom metrics, runs auth_check, and queries metrics_store scoped to the authenticated tenant (and only within tenant's residency-allowed regions). Enforces a per-tenant query-cost budget for metrics-API requests (window size, cardinality, and per-second cap) separate from the RPC rate limit; over-budget requests are rejected with explicit chunking guidance. Routes heavy queries to a documented metrics_store read path (read replicas or async result jobs) so they don't contend with usage_meter writes. Reads HLC bucket from the listener's process-local accessor. Read-only; never writes counters or state",
-      "aspects": []
+      "definition": "Handles tenant metrics read API: receives a dispatched HTTP request for tenant usage/error/latency/rate-limit-headroom metrics, runs auth_check, and queries metrics_store scoped to the authenticated tenant (and only within tenant's residency-allowed regions). Enforces a per-tenant query-cost budget for metrics-API requests (window size, cardinality, and per-second cap) separate from the RPC rate limit; over-budget requests are rejected with explicit chunking guidance. Routes heavy queries to a documented metrics_store read path (read replicas or async result jobs) so they don't contend with usage_meter writes. Reads HLC bucket from the listener's process-local accessor. Read-only; never writes counters or state"
     },
     {
       "id": "auth_check",
       "node_type": "Sidecar",
-      "definition": "In-process authentication and rate-limit/throttle gate invoked synchronously by every Subrole on every incoming request or subscription. Splits the hot path (synchronous auth_cache lookup, residency check, throttle-flag check, in-memory HLC-bucketed rate-limit counter increment) from the cold path (asynchronous tenant_store hydration on cache miss). Hot path is non-blocking and never reaches tenant_store; cold path queues hydration in the background and either rejects with a documented 'cache-miss' decision or, for high-confidence keys, accepts on a documented optimistic path with eventual reconciliation — Subroles never make this decision themselves. Exposes a bulk-hydrate batch path that the listener invokes during reconnect-storm-prewarm to fan-in tenant_store fetches into one request. Honours revocation tombstones from auth_cache immediately on TTL refresh. Exposes a re-check API used by request_path and subscription_path to re-evaluate the per-tenant throttle-flag version on long-running paths cheaply. Reads HLC bucket from the listener's process-local accessor (not region_coordinator). Emits a 'rejected-request' usage signal to usage_meter on every rejection (with reason: rate-limit, throttle, residency, revoked, malformed-auth) so per-tenant cost attribution covers rejection load and key-anomaly detection sees the rejection signal. Surfaces a degraded-mode metric whenever serving auth from existing auth_cache entries because tenant_store is unreachable",
-      "aspects": []
+      "definition": "In-process authentication and rate-limit/throttle gate invoked synchronously by every Subrole on every incoming request or subscription. Splits the hot path (synchronous auth_cache lookup, residency check, throttle-flag check, in-memory HLC-bucketed rate-limit counter increment) from the cold path (asynchronous tenant_store hydration on cache miss). Hot path is non-blocking and never reaches tenant_store; cold path queues hydration in the background and either rejects with a documented 'cache-miss' decision or, for high-confidence keys, accepts on a documented optimistic path with eventual reconciliation — Subroles never make this decision themselves. Exposes a bulk-hydrate batch path that the listener invokes during reconnect-storm-prewarm to fan-in tenant_store fetches into one request. Honours revocation tombstones from auth_cache immediately on TTL refresh. Exposes a re-check API used by request_path and subscription_path to re-evaluate the per-tenant throttle-flag version on long-running paths cheaply. Reads HLC bucket from the listener's process-local accessor (not region_coordinator). Emits a 'rejected-request' usage signal to usage_meter on every rejection (with reason: rate-limit, throttle, residency, revoked, malformed-auth) so per-tenant cost attribution covers rejection load and key-anomaly detection sees the rejection signal. Surfaces a degraded-mode metric whenever serving auth from existing auth_cache entries because tenant_store is unreachable"
     },
     {
       "id": "edge_filter",
       "node_type": "External",
-      "definition": "Boundary stand-in for the parent edge service: residency-aware anycast router that terminates TLS, applies IP rate-limiting, WAF, and bot mitigation, and forwards only API-key-bearing traffic to the gateway listener in residency-allowed regions, with reconnect-storm hints on disconnect",
-      "aspects": []
+      "definition": "Boundary stand-in for the parent edge service: residency-aware anycast router that terminates TLS, applies IP rate-limiting, WAF, and bot mitigation, and forwards only API-key-bearing traffic to the gateway listener in residency-allowed regions, with reconnect-storm hints on disconnect"
     },
     {
       "id": "auth_cache",
       "node_type": "External",
-      "definition": "Boundary stand-in for the parent auth_cache: regional tenant-credential and rate-limit-state cache with TTLs, throttle-flag fast path, and bulk hydration paths",
-      "aspects": []
+      "definition": "Boundary stand-in for the parent auth_cache: regional tenant-credential and rate-limit-state cache with TTLs, throttle-flag fast path, and bulk hydration paths"
     },
     {
       "id": "tenant_store",
       "node_type": "External",
-      "definition": "Boundary stand-in for the parent tenant_store: canonical multi-region tenant + key + plan store with residency partitioning, single-writer-per-key, and tombstoned revocations",
-      "aspects": []
+      "definition": "Boundary stand-in for the parent tenant_store: canonical multi-region tenant + key + plan store with residency partitioning, single-writer-per-key, and tombstoned revocations"
     },
     {
       "id": "chain_router",
       "node_type": "External",
-      "definition": "Boundary stand-in for the parent chain_router: per-chain pool router that selects healthy replicas, separates archive from pruned tiers, enforces query-cost budgets, and emits cost signals",
-      "aspects": []
+      "definition": "Boundary stand-in for the parent chain_router: per-chain pool router that selects healthy replicas, separates archive from pruned tiers, enforces query-cost budgets, and emits cost signals"
     },
     {
       "id": "fanout",
       "node_type": "External",
-      "definition": "Boundary stand-in for the parent fanout: subscription-multiplex service that owns subscriber registry, address index, ring buffers, cursors, finality tagging, rollback emission, and pending-tx state machine",
-      "aspects": []
+      "definition": "Boundary stand-in for the parent fanout: subscription-multiplex service that owns subscriber registry, address index, ring buffers, cursors, finality tagging, rollback emission, and pending-tx state machine"
     },
     {
       "id": "usage_meter",
       "node_type": "External",
-      "definition": "Boundary stand-in for the parent usage_meter: per-tenant cost-driver aggregation, plan-ceiling enforcement, anomaly detection, and metrics_store writer",
-      "aspects": []
+      "definition": "Boundary stand-in for the parent usage_meter: per-tenant cost-driver aggregation, plan-ceiling enforcement, anomaly detection, and metrics_store writer"
     },
     {
       "id": "metrics_store",
       "node_type": "External",
-      "definition": "Boundary stand-in for the parent metrics_store: residency-sharded per-tenant time-series store retaining at least 30 days of usage/error/latency/rate-limit-headroom metrics",
-      "aspects": []
+      "definition": "Boundary stand-in for the parent metrics_store: residency-sharded per-tenant time-series store retaining at least 30 days of usage/error/latency/rate-limit-headroom metrics"
     },
     {
       "id": "region_coordinator",
       "node_type": "External",
-      "definition": "Boundary stand-in for the parent region_coordinator: global control plane providing the hybrid logical clock, current protocol/schema version, residency policy, throttle fast-path, and canonical-tip quorum",
-      "aspects": []
+      "definition": "Boundary stand-in for the parent region_coordinator: global control plane providing the hybrid logical clock, current protocol/schema version, residency policy, throttle fast-path, and canonical-tip quorum"
     }
   ],
   "edges": [
@@ -335,7 +318,8 @@
       "description": "Every dispatched RPC, websocket, or metrics request is authenticated to a tenant via API key before it reaches a Subrole's business logic",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-ratelimit",
@@ -350,7 +334,8 @@
       "description": "Per-API-key request-rate and quota enforcement happens inside the gateway process before the request is forwarded to chain_router or fanout",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-passthrough",
@@ -362,7 +347,8 @@
       "description": "request_path forwards each chain's JSON-RPC method calls verbatim to chain_router with no cross-chain schema rewrite",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-realtime-newheads",
@@ -374,7 +360,8 @@
       "description": "subscription_path accepts WebSocket subscriptions for new block headers and forwards the stream from fanout",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-realtime-mempool",
@@ -386,7 +373,8 @@
       "description": "subscription_path accepts WebSocket subscriptions for pending/unconfirmed transactions (incl. Cardano Ogmios local-tx-monitor) and forwards the stream from fanout",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-realtime-address",
@@ -398,7 +386,8 @@
       "description": "subscription_path accepts WebSocket subscriptions for watched-address activity and forwards the matched stream from fanout",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-reorg-safe",
@@ -410,7 +399,8 @@
       "description": "subscription_path forwards explicit rollback notifications and finality status emitted by fanout to the subscriber connection",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-confirmation-threshold",
@@ -422,7 +412,8 @@
       "description": "subscription_path accepts a per-stream confirmation threshold parameter on subscribe and passes it to fanout",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-fanout-decoupled",
@@ -434,7 +425,8 @@
       "description": "subscription_path holds no per-subscription registry state; fanout owns the registry, ring buffer, and cursor positions",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-auth-cache",
@@ -446,7 +438,8 @@
       "description": "auth_check resolves API keys via auth_cache and only consults tenant_store on cache miss",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-degradation",
@@ -458,7 +451,8 @@
       "description": "On tenant_store unreachability, auth_check serves auth from existing auth_cache entries and surfaces a degraded-mode metric",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-key-rotation",
@@ -470,7 +464,8 @@
       "description": "auth_check honours revocation tombstones from auth_cache immediately on TTL refresh, supporting hot replacement and multiple active keys per tenant",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-protocol-version",
@@ -482,7 +477,8 @@
       "description": "listener advertises the gateway's protocol/schema version on every response and websocket subscription handshake, sourced from region_coordinator",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-cost-accounting",
@@ -497,7 +493,8 @@
       "description": "request_path and subscription_path emit per-request and per-event cost-driver signals (request count, response bytes, websocket egress) to usage_meter so per-tenant cost can be attributed in near-real-time",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-plan-ceilings",
@@ -509,7 +506,8 @@
       "description": "auth_check rejects requests when the throttle flag for a tenant is set in auth_cache (propagated by region_coordinator) so plan-ceiling decisions are honoured fast-path in every region",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-tenant-metrics",
@@ -521,7 +519,8 @@
       "description": "metrics_api authenticates the tenant and reads only that tenant's metrics from metrics_store, returning per-key usage, error, latency, and rate-limit-headroom data",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-bounded-clock-skew",
@@ -536,7 +535,8 @@
       "description": "auth_check and the Subroles use the hybrid logical clock from region_coordinator for time-bucketed enforcement; observed inter-region skew above the threshold puts the local gateway into a documented degraded mode that surfaces in metrics",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-historical",
@@ -548,7 +548,8 @@
       "description": "request_path forwards historical-state JSON-RPC requests verbatim to chain_router; archive vs pruned tier selection happens in chain_router",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-subscription-cursor",
@@ -560,7 +561,8 @@
       "description": "subscription_path accepts an optional resume cursor parameter on subscribe and passes it to fanout for ring-buffer replay",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-edge-protection",
@@ -576,7 +578,8 @@
       "description": "listener accepts inbound traffic only from edge_filter; no public network path exists directly to listener",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-finality-status",
@@ -591,7 +594,8 @@
       "description": "request_path attaches finality metadata returned by chain_router to the response payload; subscription_path forwards finality tags emitted by fanout",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-residency-policy",
@@ -606,7 +610,8 @@
       "description": "auth_check enforces the tenant's residency policy on every request; metrics_api scopes metrics_store reads to the tenant's residency-allowed regions",
       "origin": {
         "type": "Initial"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-sub-backpressure",
@@ -620,7 +625,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-sub-slow-consumer"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-listener-admission",
@@ -634,7 +640,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-reconnect-storm-local"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-auth-bulk-hydrate",
@@ -648,7 +655,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-reconnect-storm-local"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-fanout-subscribe-batch",
@@ -662,7 +670,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-reconnect-storm-local"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-fanout-liveness",
@@ -676,7 +685,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-fanout-outage"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-region-health-signal",
@@ -690,7 +700,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-fanout-outage"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-metrics-query-budget",
@@ -704,7 +715,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-metrics-scan-abuse"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-metrics-isolation",
@@ -718,7 +730,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-metrics-scan-abuse"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-auth-hot-cold-split",
@@ -732,7 +745,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-auth-check-bottleneck"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-throttle-recheck",
@@ -749,7 +763,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-throttle-flag-race"
-      }
+      },
+      "kind": "functional"
     },
     {
       "id": "R-gw-listener-warm-start",
@@ -763,7 +778,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-listener-cold-start"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-hlc-single-source",
@@ -777,7 +793,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-hlc-subrole-skew"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-rpc-pool-partition",
@@ -791,7 +808,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-rpc-long-tail"
-      }
+      },
+      "kind": "nonfunctional"
     },
     {
       "id": "R-gw-rejection-accounting",
@@ -805,7 +823,8 @@
         "type": "Stressor",
         "session": 1,
         "stressor": "S-auth-cost-blindspot"
-      }
+      },
+      "kind": "functional"
     }
   ],
   "satisfactions": [
@@ -953,5 +972,9 @@
       "requirement_id": "R-gw-rejection-accounting",
       "explanation": "auth_check's redefinition emits a tagged 'rejected-request' usage signal to usage_meter on every rejection; the new auth_check -> usage_meter edge captures this coupling explicitly"
     }
-  ]
+  ],
+  "decisions": [],
+  "decision_id_allocator": {
+    "next_serial": 0
+  }
 }
